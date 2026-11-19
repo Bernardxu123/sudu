@@ -6,7 +6,7 @@ use iced::widget::button::Button;
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
     button, column, container, mouse_area, operation, row, scrollable, span, stack, svg, text,
-    text_input, Column, Space,
+    text_editor, text_input, Column, Space,
 };
 use iced::{Alignment, Border, Color, Element, Font, Length, Padding, Shadow, Size, Task};
 use std::collections::HashMap;
@@ -74,6 +74,9 @@ pub enum Message {
     FontDec,
     ToggleSidebar,
     ToggleSettings,
+    ToggleEdit,
+    EditorAction(text_editor::Action),
+    Save,
     CloseSettings,
     ToggleAbout,
     CloseAbout,
@@ -123,6 +126,10 @@ pub struct App {
     font_scale: f32,
     sidebar_open: bool,
     settings_open: bool,
+    editing: bool,
+    editor: Option<text_editor::Content>,
+    dirty: bool,
+    edit_ratio: f32,
     about_open: bool,
     find_open: bool,
     find_input: String,
@@ -170,6 +177,10 @@ impl App {
             font_scale: 1.0,
             sidebar_open: false,
             settings_open: false,
+            editing: false,
+            editor: None,
+            dirty: false,
+            edit_ratio: 0.0,
             about_open: false,
             find_open: false,
             find_input: String::new(),
@@ -254,6 +265,29 @@ impl App {
                 self.quick = None;
                 Task::none()
             }
+            Message::ToggleEdit => {
+                if self.editing {
+                    self.save_and_finish()
+                } else {
+                    self.begin_edit()
+                }
+            }
+            Message::EditorAction(action) => {
+                if let Some(editor) = self.editor.as_mut() {
+                    if action.is_edit() {
+                        self.dirty = true;
+                    }
+                    editor.perform(action);
+                }
+                Task::none()
+            }
+            Message::Save => {
+                if self.editing {
+                    self.save_and_finish()
+                } else {
+                    Task::none()
+                }
+            }
             Message::CloseSettings => {
                 self.settings_open = false;
                 Task::none()
@@ -268,6 +302,10 @@ impl App {
                 Task::none()
             }
             Message::OpenFind => {
+                if self.editing {
+                    self.notice = Some(String::from("先保存并退出编辑，再在本文中查找"));
+                    return Task::none();
+                }
                 self.find_open = true;
                 self.settings_open = false;
                 let focus = operation::focus(find_input_id());
@@ -314,6 +352,9 @@ impl App {
                 self.jump_current_match()
             }
             Message::OpenFile => {
+                if !self.can_leave_document() {
+                    return Task::none();
+                }
                 self.settings_open = false;
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Markdown", &["md", "markdown", "mdx"])
@@ -325,6 +366,9 @@ impl App {
                 Task::none()
             }
             Message::OpenFolder => {
+                if !self.can_leave_document() {
+                    return Task::none();
+                }
                 self.settings_open = false;
                 if let Some(root) = rfd::FileDialog::new().pick_folder() {
                     let files = scan_markdown(&root);
@@ -343,6 +387,9 @@ impl App {
                 Task::none()
             }
             Message::Reload => {
+                if !self.can_leave_document() {
+                    return Task::none();
+                }
                 if let Some(path) = self.path.clone() {
                     let ratio = self.scroll_ratio;
                     return self.open_path(path, Some(ratio));
@@ -376,7 +423,14 @@ impl App {
                 }
                 Task::none()
             }
-            Message::WindowCloseRequested => self.win(iced::window::close),
+            Message::WindowCloseRequested => {
+                if self.editing && self.dirty {
+                    self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存后再关闭"));
+                    Task::none()
+                } else {
+                    self.win(iced::window::close)
+                }
+            }
             Message::Measure => self.measure(),
             Message::Offsets(map) => {
                 self.offsets = map;
@@ -419,11 +473,17 @@ impl App {
                 Task::none()
             }
             Message::QuickOpen(path) => {
+                if !self.can_leave_document() {
+                    return Task::none();
+                }
                 self.quick = None;
                 self.pending_anchor = None;
                 self.open_path(path, None)
             }
             Message::QuickOpenFirst => {
+                if !self.can_leave_document() {
+                    return Task::none();
+                }
                 if let Some((path, _)) = self.quick_matches().into_iter().next() {
                     self.quick = None;
                     self.pending_anchor = None;
@@ -447,6 +507,13 @@ impl App {
                     self.matches = Arc::new(Vec::new());
                     self.current_match = None;
                     self.search_rev += 1;
+                } else if self.editing {
+                    if self.dirty {
+                        self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存"));
+                    } else {
+                        self.editing = false;
+                        self.editor = None;
+                    }
                 }
                 Task::none()
             }
@@ -500,6 +567,70 @@ impl App {
     fn after_metrics_change(&mut self) -> Task<Message> {
         self.offsets.clear();
         self.current_heading = None;
+        offsets::snap_to_ratio(self.scroll_ratio)
+    }
+
+    fn can_leave_document(&mut self) -> bool {
+        if self.editing && self.dirty {
+            self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存后再切换"));
+            false
+        } else {
+            true
+        }
+    }
+
+    fn begin_edit(&mut self) -> Task<Message> {
+        self.edit_ratio = self.scroll_ratio;
+        self.editor = Some(text_editor::Content::with_text(&self.doc.source));
+        self.editing = true;
+        self.dirty = false;
+        self.find_open = false;
+        self.settings_open = false;
+        self.quick = None;
+        self.notice = None;
+        Task::none()
+    }
+
+    fn save_and_finish(&mut self) -> Task<Message> {
+        let Some(text) = self.editor.as_ref().map(|editor| editor.text()) else {
+            self.editing = false;
+            return Task::none();
+        };
+        let path = match self.path.clone() {
+            Some(path) => path,
+            None => match rfd::FileDialog::new()
+                .add_filter("Markdown", &["md", "markdown", "mdx"])
+                .set_file_name("快速入门.md")
+                .save_file()
+            {
+                Some(path) => path,
+                None => return Task::none(),
+            },
+        };
+        if let Err(error) = std::fs::write(&path, &text) {
+            self.notice = Some(format!("保存失败：{error}"));
+            return Task::none();
+        }
+        let parsed = doc::parse(&text, Some(&path));
+        self.doc = Arc::new(parsed);
+        self.path = Some(path.clone());
+        if self.root.is_none() {
+            self.root = path.parent().map(Path::to_path_buf);
+        }
+        self.doc_rev += 1;
+        self.offsets.clear();
+        self.current_heading = None;
+        self.pending_jump = None;
+        self.find_open = false;
+        self.find_input.clear();
+        self.matches = Arc::new(Vec::new());
+        self.current_match = None;
+        self.search_rev += 1;
+        self.editing = false;
+        self.editor = None;
+        self.dirty = false;
+        self.notice = Some(String::from("已保存"));
+        self.scroll_ratio = self.edit_ratio;
         offsets::snap_to_ratio(self.scroll_ratio)
     }
 
@@ -636,6 +767,9 @@ impl App {
                 self.search_rev += 1;
                 self.quick = None;
                 self.notice = None;
+                self.editing = false;
+                self.editor = None;
+                self.dirty = false;
                 self.anim_current = 0.0;
                 self.scroll_ratio = ratio.unwrap_or(0.0);
                 let mut task = offsets::snap_to_ratio(self.scroll_ratio);
@@ -671,7 +805,7 @@ impl App {
     }
 
     fn content_width(&self, max_width: f32) -> f32 {
-        let sidebar = if self.sidebar_open {
+        let sidebar = if self.sidebar_open && !self.editing {
             SIDEBAR_WIDTH
         } else {
             0.0
@@ -773,9 +907,13 @@ impl App {
         );
         let title = mouse_area(
             container(
-                text(format!("素读 — {}", self.source_name()))
-                    .size(12)
-                    .color(pal.muted),
+                text(if self.dirty {
+                    format!("素读 — {} *", self.source_name())
+                } else {
+                    format!("素读 — {}", self.source_name())
+                })
+                .size(12)
+                .color(pal.muted),
             )
             .width(Length::Fill)
             .height(Length::Fill)
@@ -789,6 +927,11 @@ impl App {
         )
         .on_press(Message::DragWindow)
         .on_double_click(Message::ToggleMaximize);
+        let edit = if self.editing {
+            icon_button(icon_save(), true, pal, Message::Save)
+        } else {
+            icon_button(icon_edit(), false, pal, Message::ToggleEdit)
+        };
         let search = icon_button(icon_search(), self.find_open, pal, Message::OpenFind);
         let settings = icon_button(
             icon_settings(),
@@ -806,7 +949,7 @@ impl App {
         let close = window_icon_button(icon_close(), true, pal, Message::CloseWindow);
         column![
             container(
-                row![sidebar, title, search, settings, min, max, close]
+                row![sidebar, title, edit, search, settings, min, max, close]
                     .height(Length::Fill)
                     .align_y(Alignment::Center)
             )
@@ -823,7 +966,7 @@ impl App {
     }
 
     fn sidebar(&self, _t: &Theme, pal: Palette) -> Element<'_, Message> {
-        if !self.sidebar_open {
+        if !self.sidebar_open || self.editing {
             return Space::new().into();
         }
         let mut list = Column::new().spacing(1).width(Length::Fill);
@@ -898,6 +1041,48 @@ impl App {
     }
 
     fn content(&self, t: &Theme, pal: Palette) -> Element<'_, Message> {
+        if self.editing {
+            if let Some(editor) = &self.editor {
+                let width = self.content_width(t.width);
+                let editor = text_editor(editor)
+                    .on_action(Message::EditorAction)
+                    .font(t.mono)
+                    .size(t.size * self.font_scale * 0.95)
+                    .line_height(LineHeight::Relative(1.65))
+                    .padding(Padding::from([20.0, 16.0]))
+                    .height(Length::Fill)
+                    .style(move |_, _| text_editor::Style {
+                        background: pal.bg.into(),
+                        border: Border::default(),
+                        placeholder: pal.muted,
+                        value: pal.text,
+                        selection: pal.selection,
+                    });
+                let paper = container(editor)
+                    .width(Length::Fixed(width))
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(pal.bg.into()),
+                        border: Border {
+                            color: pal.border,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    });
+                return container(paper)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .padding(Padding {
+                        top: 16.0,
+                        right: 0.0,
+                        bottom: 16.0,
+                        left: 0.0,
+                    })
+                    .into();
+            }
+        }
         let width = self.content_width(t.width);
         let body = iced::widget::lazy(self.body_key(t), |key| render_body(key));
         let paper = container(body)
@@ -1211,19 +1396,31 @@ impl App {
             .clone()
             .or_else(|| self.last_link.clone())
             .unwrap_or_default();
+        let progress = if self.editing {
+            String::from("编辑中")
+        } else {
+            format!("{:.0}%", self.scroll_ratio * 100.0)
+        };
+        let words = if self.editing {
+            String::from("— 字")
+        } else {
+            format!("{} 字", self.doc.words)
+        };
+        let lines = if self.editing {
+            self.editor
+                .as_ref()
+                .map(|editor| format!("{} 行", editor.line_count()))
+                .unwrap_or_default()
+        } else {
+            format!("{} 行", self.doc.lines)
+        };
         column![
             hline(pal.border, 1.0),
             container(
                 row![
-                    text(format!("{:.0}%", self.scroll_ratio * 100.0))
-                        .size(11)
-                        .color(pal.muted),
-                    text(format!("{} 字", self.doc.words))
-                        .size(11)
-                        .color(pal.muted),
-                    text(format!("{} 行", self.doc.lines))
-                        .size(11)
-                        .color(pal.muted),
+                    text(progress).size(11).color(pal.muted),
+                    text(words).size(11).color(pal.muted),
+                    text(lines).size(11).color(pal.muted),
                     Space::new().width(Length::Fill),
                     text(notice).size(11).color(pal.muted),
                     text(self.source_name()).size(11).color(pal.muted),
@@ -1355,6 +1552,8 @@ fn key_event(
         iced::keyboard::Key::Character(c) if command => match c.as_str() {
             "b" => Some(Message::ToggleSidebar),
             "f" => Some(Message::OpenFind),
+            "e" => Some(Message::ToggleEdit),
+            "s" => Some(Message::Save),
             "o" if shift => Some(Message::OpenFolder),
             "o" => Some(Message::OpenFile),
             "p" => Some(Message::OpenFolder),
@@ -1453,6 +1652,14 @@ fn icon_settings() -> svg::Handle {
 
 fn icon_sidebar() -> svg::Handle {
     svg::Handle::from_memory(&include_bytes!("../assets/icons/sidebar.svg")[..])
+}
+
+fn icon_edit() -> svg::Handle {
+    svg::Handle::from_memory(&include_bytes!("../assets/icons/edit.svg")[..])
+}
+
+fn icon_save() -> svg::Handle {
+    svg::Handle::from_memory(&include_bytes!("../assets/icons/save.svg")[..])
 }
 
 fn icon_minimize() -> svg::Handle {

@@ -7,6 +7,7 @@ pub struct Doc {
     pub blocks: Vec<Block>,
     pub headings: Vec<Heading>,
     pub path: Option<PathBuf>,
+    pub source: String,
     pub words: usize,
     pub lines: usize,
 }
@@ -427,6 +428,7 @@ impl<'a> Builder<'a> {
             blocks: self.blocks,
             headings: self.headings,
             path: self.path.map(Path::to_path_buf),
+            source: source.to_string(),
             words,
             lines: source.lines().count(),
         }

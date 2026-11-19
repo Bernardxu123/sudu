@@ -19,6 +19,7 @@ fn main() -> iced::Result {
         min_size: Some(iced::Size::new(720.0, 480.0)),
         decorations: false,
         resizable: true,
+        icon: window_icon(),
         ..Default::default()
     };
     iced::application(
@@ -37,4 +38,11 @@ fn main() -> iced::Result {
     .window(window)
     .default_font(theme::ui_font())
     .run()
+}
+
+fn window_icon() -> Option<iced::window::Icon> {
+    let image = image::load_from_memory(include_bytes!("../assets/icon-256.png")).ok()?;
+    let image = image.to_rgba8();
+    let (width, height) = image.dimensions();
+    iced::window::icon::from_rgba(image.into_raw(), width, height).ok()
 }

@@ -24,7 +24,7 @@
 ## 字体
 
 - 不捆绑字体。启动只检查 `%WINDIR%\Fonts` 与 `%LOCALAPPDATA%\Microsoft\Windows\Fonts` 的候选文件是否存在，再映射到英文家族名。
-- 纸/米黄：思源宋体（`Source Han Serif SC`）→ `SimSun`；白/夜：`Microsoft YaHei UI` → `Segoe UI`；代码：`Consolas` → `Cascadia Mono`。
+- 正文与 UI 统一无衬线：`Microsoft YaHei UI` → `Segoe UI`；代码：`Consolas` → `Cascadia Mono`。用户 2026-11-19 明确喜欢无衬线，纸/米黄的思源宋体/SimSun 衬线链已移除。
 - cosmic-text/fontdb 由 iced 内部加载系统字体；我们不再引入 fontdb，避免重复扫描（阶段②实测启动时间）。
 - 若家族名不命中，cosmic-text 会静默回退；必须用截图验证，而不是只看代码。
 
@@ -60,7 +60,7 @@
 - 选区/复制：中英混排在 crates.io `iced_selection 0.5.0` 上通过；Ctrl+C 复制文本正确；选中第二段后第一段高亮立即清除，不需要 vendored patch。
 - 链接：span 的 `link` + `on_link_click` 生效；单击前光标必须先移动到链接上（产生 hover），正常使用无感。
 - 坐标：`CollectOffsets` 在懒渲染正文里收到 37 个块；`scroll_to` 跳转到第 4 块成功；跳转/滚动后 `renders` 保持 1，Lazy 未重建。
-- 主题：四套都能渲染；`纸/米黄` 命中已安装的 `NotoSerifSC-VF.ttf`（家族名 `Noto Serif SC`），标题粗体可见；`白/夜` 命中 `Microsoft YaHei UI`；代码 `Consolas`。
+- 主题：四套都能渲染；`纸/米黄` 当时命中已安装的 `NotoSerifSC-VF.ttf`（家族名 `Noto Serif SC`），`白/夜` 命中 `Microsoft YaHei UI`；代码 `Consolas`。后续按用户偏好已全部改为无衬线（见上文）。
 - 已知问题：1 MB 文档 WorkingSet 233 MB（tiny-skia），需要后续 virt 分块；正文宽度已改为按窗口与侧栏计算后居中。
 - 表格：pulldown-cmark 的表头是 `TableHead` + 直接 `TableCell`，没有 `TableRow`；必须自己把表头开成 `TableRow { header: true }`，否则表头会被当成普通段落。
 - 阴影：iced 0.14 tiny-skia 在 `stack` 覆盖层里给 container 设置 `Shadow` 会逐帧累积 alpha，菜单/查找框会慢慢变黑。已移除所有容器阴影，只保留 1px 边框；证据 `no-shadow-1.png` / `no-shadow-2.png`（像素 245,246,248 不变）。
@@ -71,8 +71,22 @@
 - Moeka（GPUI）的做法：`Cargo.toml` 用 `gpui 0.2.2`，README 明确 GPU / 120Hz / on-demand rendering；`src/editor/input.rs:4553` 的 `on_scroll` 直接 `scroll_offset -= delta_y`（`pixel_delta(line_height)`），没有动画；`src/editor/list_viewport.rs` 只渲染 visible/render/preload 窗口并在上下留 spacer。
 - 素读对应改成：`SmoothScroll` 仍拦截 `WheelScrolled`，但立即 `scroll_to`；`Lines` 步长 = 正文字号 × 行高（约 31 px），`Pixels` 1:1；删除 16 ms 动画订阅和 `AnimTick`。
 - 后端：默认 `backend-wgpu`（GPU，接近 Moeka 的路线）；`backend-tiny` 保留为轻量构建。
-- 实测：wgpu 11.38 MB / 首事件 968 ms / WorkingSet 184 MB / 快速滚轮 CPU 0.03 核；tiny-skia 6.74 MB / 137 ms / 26.8 MB / 0.56 核。两条 exe 都在 `dist\`。
-- 图标：`assets/icons` 使用 iconly 的 `Search_528.svg`（Light-Outline）与 `Setting_530.svg`，侧栏/最小化/最大化/还原/关闭为同风格 16×16 线性 SVG；iced 开启 `svg` feature，用 `svg::Style { color }` 按主题着色。
+- 实测：wgpu 11.57 MB / 首事件 968 ms / WorkingSet 184 MB / 快速滚轮 CPU 0.03 核；tiny-skia 6.93 MB / 137 ms / 26.8 MB / 0.56 核。两条 exe 都在 `dist\`。
+- 图标：`assets/icons` 使用 iconly 的 `Search_528.svg`（Light-Outline）与 `Setting_530.svg`，侧栏/编辑/保存/最小化/最大化/还原/关闭为同风格线性 SVG；iced 开启 `svg` feature，用 `svg::Style { color }` 按主题着色。
+
+## 编辑（2026-11-19）
+
+- 源码模式：`text_editor::Content::with_text(&doc.source)`；`Action::is_edit()` 才置 dirty（滚动/移动光标不算）；Ctrl+E 或右上角铅笔进入，Ctrl+S 或勾号保存。
+- 保存：有路径直接写；无路径（内置快速入门）弹 `rfd::FileDialog::save_file`；写盘后 `doc::parse` + `doc_rev++` 重新渲染，回阅读并恢复 `edit_ratio`。
+- 未保存时切换文件/快速打开/关闭窗口都拦截，状态栏提示先 Ctrl+S；Esc 在无修改时退出编辑。富文本 / 所见即所得编辑不做。
+
+## 应用图标
+
+- 用户提供黑书本白底 JPG；`tools/make_icon.py` 用 Pillow 裁内容、30%→12% padding、白色圆角 tile（1024，radius 230），输出 `assets/icon-256.png` 与多尺寸 `assets/icon.ico`。
+- 窗口图标：`image::load_from_memory` 解码 PNG → `iced::window::icon::from_rgba`；taskbar 显示。
+- exe 资源：`winresource` 直接跑 `windres` 会因中文源路径报 `Bad file descriptor`（`-I D:\AI\杂\素读`）；改为 `build.rs` 把 `icon.ico`/`icon.rc` 复制到 `OUT_DIR` 的 ASCII staging 目录，cwd 那里执行 `windres`，输出 `icon.o`，再用 `cargo:rustc-link-arg` 链接。
+- 文件关联的 `DefaultIcon` 指向 `dist\sudu.exe`，exe 内嵌图标后 Explorer / 打开方式可见。
+
 
 
 

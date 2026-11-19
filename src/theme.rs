@@ -29,7 +29,6 @@ pub struct Theme {
 }
 
 struct Fonts {
-    serif: Font,
     sans: Font,
     mono: Font,
     ui: Font,
@@ -73,21 +72,6 @@ fn pick(files: &[&str], family: &'static str, fallback: &'static str) -> Font {
 fn fonts() -> &'static Fonts {
     static FONTS: OnceLock<Fonts> = OnceLock::new();
     FONTS.get_or_init(|| {
-        let serif = if has_font(&[
-            "SourceHanSerifSC-Regular.otf",
-            "SourceHanSerifSC-Regular.ttf",
-            "SourceHanSerifSC-VF.otf",
-        ]) {
-            Font::with_name("Source Han Serif SC")
-        } else if has_font(&["NotoSerifCJKsc-Regular.otf", "NotoSerifCJK-Regular.ttc"]) {
-            Font::with_name("Noto Serif CJK SC")
-        } else if has_font(&["NotoSerifSC-VF.ttf", "NotoSerifSC-Regular.otf"]) {
-            Font::with_name("Noto Serif SC")
-        } else if has_font(&["simsun.ttc"]) {
-            Font::with_name("SimSun")
-        } else {
-            Font::with_name("Georgia")
-        };
         let sans = pick(&["msyh.ttc"], "Microsoft YaHei UI", "Segoe UI");
         let ui = pick(&["msyh.ttc"], "Microsoft YaHei UI", "Segoe UI");
         let mono = if has_font(&["consola.ttf"]) {
@@ -97,12 +81,7 @@ fn fonts() -> &'static Fonts {
         } else {
             Font::with_name("Courier New")
         };
-        Fonts {
-            serif,
-            sans,
-            mono,
-            ui,
-        }
+        Fonts { sans, mono, ui }
     })
 }
 
@@ -149,7 +128,7 @@ pub fn all() -> [Theme; 4] {
                 code_bg: rgb(0xF1, 0xE9, 0xDA),
                 border: rgb(0xE2, 0xD7, 0xC5),
             },
-            body: f.serif,
+            body: f.sans,
             mono: f.mono,
             size: 18.0,
             line: 1.95,
@@ -191,7 +170,7 @@ pub fn all() -> [Theme; 4] {
                 code_bg: rgb(0xED, 0xE1, 0xC9),
                 border: rgb(0xDC, 0xCB, 0xA8),
             },
-            body: f.serif,
+            body: f.sans,
             mono: f.mono,
             size: 18.0,
             line: 1.95,
