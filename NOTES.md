@@ -63,3 +63,12 @@
 - 主题：四套都能渲染；`纸/米黄` 命中已安装的 `NotoSerifSC-VF.ttf`（家族名 `Noto Serif SC`），标题粗体可见；`白/夜` 命中 `Microsoft YaHei UI`；代码 `Consolas`。
 - 已知问题：1 MB 文档 WorkingSet 233 MB，超出 150 MB 目标；根因是 3763 个独立 Rich 文本块，需要后续 virt 分块。正文水平居中偏左，阶段④重做壳时修。
 
+## 滚动（2026-11-19）
+
+- 卡顿根因不是帧率：iced 0.14 的 Scrollable 对滚轮 `Lines` 直接执行 `-movement * 60.0`（每格 60 px，无动画）；实测滚动时 CPU 只有 0.08 核，画面是整段跳 60 px，所以看起来卡。
+- 修复：`src/smooth.rs` 的 `SmoothScroll` 在 Scrollable 外层拦截 `WheelScrolled`；`Lines` 发 `Message::Wheel`，按 16 ms tick、0.4 系数缓出到目标（约 150–200 ms）；`Pixels` 发 `Message::WheelPixels` 直接 1:1 滚动，避免触控板二次平滑。
+- 注意：滚动过程中 `scroll_to` 会触发延迟的 `on_scroll`；停止动画的判定阈值放到 80 px，否则上一帧的 offset 会把动画提前掐断。
+- 实测（release tiny-skia）：启动 93 ms、WorkingSet 26.9 MB、exe 5.97 MB 不变；快速滚轮时 CPU 0.83–0.88 核（60 fps 软件渲染的代价），空闲 0.08 核。1 MB 文档滚动 CPU 相同，初始布局仍为 437 ms / 233 MB。
+- 证据：`SUDU_SCROLL_LOG` 记录的 0 → 24.0 → 38.4 → 47.0 → 52.2 → 55.3 → 57.2 → 58.3 → 59.4 → 60.0；录屏 `D:\AI\sudu-target\scroll.mp4` 与 `scroll.gif`。
+
+

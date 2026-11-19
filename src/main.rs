@@ -3,6 +3,7 @@
 
 mod app;
 mod offsets;
+mod smooth;
 mod theme;
 
 use std::path::PathBuf;

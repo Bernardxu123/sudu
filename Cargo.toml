@@ -11,7 +11,7 @@ backend-tiny = ["iced/tiny-skia"]
 backend-wgpu = ["iced/wgpu"]
 
 [dependencies]
-iced = { version = "0.14", default-features = false, features = ["image", "advanced", "lazy", "crisp", "web-colors", "thread-pool"] }
+iced = { version = "0.14", default-features = false, features = ["image", "advanced", "lazy", "crisp", "web-colors", "tokio"] }
 iced_selection = "0.5"
 open = "5"
 

@@ -70,6 +70,9 @@ pub enum Message {
     Offsets(HashMap<usize, f32>),
     Jump(usize),
     Scroll(scrollable::Viewport),
+    Wheel(f32),
+    WheelPixels(f32),
+    AnimTick,
     OpenLink(String),
     ProbeFrame,
 }
@@ -81,6 +84,11 @@ pub struct App {
     offsets: HashMap<usize, f32>,
     pending_jump: Option<usize>,
     scroll_ratio: f32,
+    viewport: Option<scrollable::Viewport>,
+    anim_current: f32,
+    anim_target: f32,
+    animating: bool,
+    scroll_log: Option<PathBuf>,
     last_link: Option<String>,
     renders: Arc<AtomicU32>,
     start: Instant,
@@ -103,6 +111,11 @@ impl App {
             offsets: HashMap::new(),
             pending_jump: None,
             scroll_ratio: 0.0,
+            viewport: None,
+            anim_current: 0.0,
+            anim_target: 0.0,
+            animating: false,
+            scroll_log: std::env::var_os("SUDU_SCROLL_LOG").map(PathBuf::from),
             last_link: None,
             renders: Arc::new(AtomicU32::new(0)),
             start,
@@ -151,7 +164,12 @@ impl App {
         } else {
             iced::Subscription::none()
         };
-        iced::Subscription::batch([keys, probe])
+        let anim = if self.animating {
+            iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::AnimTick)
+        } else {
+            iced::Subscription::none()
+        };
+        iced::Subscription::batch([keys, probe, anim])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -159,6 +177,7 @@ impl App {
             Message::NextTheme => {
                 self.theme_idx = (self.theme_idx + 1) % 4;
                 self.offsets.clear();
+                self.animating = false;
                 Task::none()
             }
             Message::Measure => self.measure(),
@@ -166,6 +185,9 @@ impl App {
                 self.offsets = map;
                 if let Some(index) = self.pending_jump.take() {
                     if let Some(y) = self.offsets.get(&index).copied() {
+                        self.animating = false;
+                        self.anim_current = y - 8.0;
+                        self.anim_target = self.anim_current;
                         return offsets::scroll_to_y(y - 8.0);
                     }
                 }
@@ -173,6 +195,9 @@ impl App {
             }
             Message::Jump(index) => {
                 if let Some(y) = self.offsets.get(&index).copied() {
+                    self.animating = false;
+                    self.anim_current = y - 8.0;
+                    self.anim_target = self.anim_current;
                     offsets::scroll_to_y(y - 8.0)
                 } else {
                     self.pending_jump = Some(index);
@@ -181,14 +206,92 @@ impl App {
             }
             Message::Scroll(viewport) => {
                 let offset = viewport.absolute_offset().y;
-                let content = viewport.content_bounds().height;
-                let view = viewport.bounds().height;
-                self.scroll_ratio = if content > view {
-                    (offset / (content - view)).clamp(0.0, 1.0)
+                self.log_line(format_args!("scroll {offset:.1} anim={}", self.animating));
+                if self.animating && (offset - self.anim_current).abs() > 80.0 {
+                    self.animating = false;
+                }
+                self.viewport = Some(viewport);
+                if !self.animating {
+                    self.anim_current = offset;
+                }
+                let ratio_offset = if self.animating {
+                    self.anim_current
                 } else {
-                    0.0
+                    offset
                 };
+                self.sync_ratio(ratio_offset);
                 Task::none()
+            }
+            Message::Wheel(dy) => {
+                let current = self
+                    .viewport
+                    .map(|viewport| viewport.absolute_offset().y)
+                    .unwrap_or(self.anim_current);
+                let base = if self.animating {
+                    self.anim_target
+                } else {
+                    current
+                };
+                let max = self.viewport.map(|viewport| {
+                    (viewport.content_bounds().height - viewport.bounds().height).max(0.0)
+                });
+                let target = match max {
+                    Some(max) => (base + dy).clamp(0.0, max),
+                    None => (base + dy).max(0.0),
+                };
+                if !self.animating && (target - current).abs() < 0.5 {
+                    return Task::none();
+                }
+                self.anim_target = target;
+                if !self.animating {
+                    self.anim_current = current;
+                    self.animating = true;
+                }
+                self.log_line(format_args!(
+                    "wheel cur={current:.1} base={base:.1} tgt={target:.1}"
+                ));
+                Task::none()
+            }
+            Message::WheelPixels(dy) => {
+                let current = self
+                    .viewport
+                    .map(|viewport| viewport.absolute_offset().y)
+                    .unwrap_or(self.anim_current);
+                let max = self.viewport.map(|viewport| {
+                    (viewport.content_bounds().height - viewport.bounds().height).max(0.0)
+                });
+                let target = match max {
+                    Some(max) => (current + dy).clamp(0.0, max),
+                    None => (current + dy).max(0.0),
+                };
+                self.animating = false;
+                self.anim_current = target;
+                self.anim_target = target;
+                self.sync_ratio(target);
+                if (target - current).abs() < 0.1 {
+                    Task::none()
+                } else {
+                    offsets::scroll_to_y(target)
+                }
+            }
+            Message::AnimTick => {
+                if !self.animating {
+                    return Task::none();
+                }
+                self.log_line(format_args!(
+                    "tick cur={:.1} tgt={:.1}",
+                    self.anim_current, self.anim_target
+                ));
+                let diff = self.anim_target - self.anim_current;
+                if diff.abs() < 0.8 {
+                    self.anim_current = self.anim_target;
+                    self.animating = false;
+                    self.sync_ratio(self.anim_current);
+                    return offsets::scroll_to_y(self.anim_current);
+                }
+                self.anim_current += diff * 0.4;
+                self.sync_ratio(self.anim_current);
+                offsets::scroll_to_y(self.anim_current)
             }
             Message::OpenLink(url) => {
                 if (url.starts_with("http://") || url.starts_with("https://"))
@@ -204,6 +307,31 @@ impl App {
                     let _ = std::fs::write(path, self.start.elapsed().as_millis().to_string());
                 }
                 Task::none()
+            }
+        }
+    }
+
+    fn sync_ratio(&mut self, offset: f32) {
+        if let Some(viewport) = self.viewport {
+            let content = viewport.content_bounds().height;
+            let view = viewport.bounds().height;
+            self.scroll_ratio = if content > view {
+                (offset / (content - view)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+    }
+
+    fn log_line(&self, args: std::fmt::Arguments<'_>) {
+        if let Some(path) = &self.scroll_log {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(file, "{args}");
             }
         }
     }
@@ -255,6 +383,7 @@ impl App {
             .id(offsets::body_id())
             .on_scroll(Message::Scroll)
             .height(Length::Fill);
+        let scroller = crate::smooth::SmoothScroll::new(scroller);
 
         let top = container(
             row![
