@@ -52,6 +52,14 @@ cargo build --release --no-default-features --features backend-tiny   # 轻量�
 
 产物在 `D:\AI\sudu-target\release\sudu.exe`；本仓库的 `dist\` 里放了两种构建。
 
+`D:\AI\杂` 目录带 Low 完整性标签，直接复制进 `dist\` 的 exe 会继承该标签，运行时无法写入普通文件（保存报“拒绝访问”）。打包时用脚本复制并设置 Medium：
+
+```powershell
+pwsh tools\package.ps1 -Source D:\AI\sudu-target\release\sudu.exe -Dest D:\AI\杂\素读\dist\sudu.exe
+```
+
+`dist\sudu.exe` 与 `dist\sudu-tiny.exe` 已按此设置。
+
 ## 实测（release，本机 Windows 11 / 32 GB）
 
 | 后端 | exe | 首事件中位 | 空闲 WorkingSet | 快速滚轮 CPU |

@@ -80,6 +80,14 @@
 - 保存：有路径直接写；无路径（内置快速入门）弹 `rfd::FileDialog::save_file`；写盘后 `doc::parse` + `doc_rev++` 重新渲染，回阅读并恢复 `edit_ratio`。
 - 未保存时切换文件/快速打开/关闭窗口都拦截，状态栏提示先 Ctrl+S；Esc 在无修改时退出编辑。富文本 / 所见即所得编辑不做。
 
+## 保存与完整性标签（2026-11-19）
+
+- 现象：`dist\sudu.exe` 编辑后 Ctrl+S 报 `保存失败：拒绝访问。 (os error 5)`；同一份代码从 `D:\AI\sudu-target\debug\sudu.exe` 启动则保存正常。
+- 根因：`D:\AI\杂` 目录带显式 `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`，`dist` 与其中的 exe 继承 Low。Windows 会按映像的完整性标签启动进程，Low 进程不能写 Medium 文件（no-write-up）。
+- 证据：token 查询 `dist\sudu-diag.exe` 进程为 `S-1-16-4096`（Low），`D:\AI\sudu-target\debug\sudu.exe` 为 `S-1-16-12288`（High）；`icacls dist\sudu-diag.exe /setintegritylevel Medium` 后进程变为 `S-1-16-8192`（Medium），Ctrl+S 成功写入 `D:\AI\sudu-target\save-test.md`（内容 `MEDIUMOK`）。
+- 解决：以后用 `tools\package.ps1` 复制 release 并设置 Medium；`dist\sudu.exe` 与 `dist\sudu-tiny.exe` 已设置。不要直接 `cp` 到 `dist`，复制会继承 Low 标签。
+- `D:\AI\杂` 本身的标签未改，避免影响目录内其他工具；如果以后要彻底恢复该工作区的普通权限，需要单独确认后再处理。
+
 ## 应用图标
 
 - 用户提供黑书本白底 JPG；`tools/make_icon.py` 用 Pillow 裁内容、30%→12% padding、白色圆角 tile（1024，radius 230），输出 `assets/icon-256.png` 与多尺寸 `assets/icon.ico`。
