@@ -1,0 +1,23 @@
+[package]
+name = "sudu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "素读 — 轻量中文 Markdown 阅读器"
+
+[features]
+default = ["backend-tiny"]
+backend-tiny = ["iced/tiny-skia"]
+backend-wgpu = ["iced/wgpu"]
+
+[dependencies]
+iced = { version = "0.14", default-features = false, features = ["image", "advanced", "lazy", "crisp", "web-colors", "thread-pool"] }
+iced_selection = "0.5"
+open = "5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
