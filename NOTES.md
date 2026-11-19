@@ -56,19 +56,23 @@
 ## 阶段② Gate 数据（release，tiny-skia vs wgpu）
 
 - tiny-skia：exe 5.86 MB；37 块样文启动中位 84 ms（窗口句柄 45 ms）、WorkingSet 26.7 MB；1 MB / 3763 段落：首个事件 437 ms、WorkingSet 232.8 MB。
-- wgpu：exe 10.23 MB；样文首个事件约 925 ms、WorkingSet 182.8 MB（首次运行更高）。纯文本阅读器上 tiny-skia 全面胜出，默认保留 tiny-skia。
+- wgpu：exe 10.23 MB；样文首个事件约 925 ms、WorkingSet 182.8 MB（首次运行更高）。当时按启动/内存优先选 tiny-skia；后续对比 Moeka 后改成流畅度优先，默认后端已切到 wgpu（见下文「滚动与流畅度」）。
 - 选区/复制：中英混排在 crates.io `iced_selection 0.5.0` 上通过；Ctrl+C 复制文本正确；选中第二段后第一段高亮立即清除，不需要 vendored patch。
 - 链接：span 的 `link` + `on_link_click` 生效；单击前光标必须先移动到链接上（产生 hover），正常使用无感。
 - 坐标：`CollectOffsets` 在懒渲染正文里收到 37 个块；`scroll_to` 跳转到第 4 块成功；跳转/滚动后 `renders` 保持 1，Lazy 未重建。
 - 主题：四套都能渲染；`纸/米黄` 命中已安装的 `NotoSerifSC-VF.ttf`（家族名 `Noto Serif SC`），标题粗体可见；`白/夜` 命中 `Microsoft YaHei UI`；代码 `Consolas`。
-- 已知问题：1 MB 文档 WorkingSet 233 MB，超出 150 MB 目标；根因是 3763 个独立 Rich 文本块，需要后续 virt 分块。正文水平居中偏左，阶段④重做壳时修。
+- 已知问题：1 MB 文档 WorkingSet 233 MB（tiny-skia），需要后续 virt 分块；正文宽度已改为按窗口与侧栏计算后居中。
+- 表格：pulldown-cmark 的表头是 `TableHead` + 直接 `TableCell`，没有 `TableRow`；必须自己把表头开成 `TableRow { header: true }`，否则表头会被当成普通段落。
+- 阴影：iced 0.14 tiny-skia 在 `stack` 覆盖层里给 container 设置 `Shadow` 会逐帧累积 alpha，菜单/查找框会慢慢变黑。已移除所有容器阴影，只保留 1px 边框；证据 `no-shadow-1.png` / `no-shadow-2.png`（像素 245,246,248 不变）。
 
-## 滚动（2026-11-19）
+## 滚动与流畅度（2026-11-19 两次修正）
 
-- 卡顿根因不是帧率：iced 0.14 的 Scrollable 对滚轮 `Lines` 直接执行 `-movement * 60.0`（每格 60 px，无动画）；实测滚动时 CPU 只有 0.08 核，画面是整段跳 60 px，所以看起来卡。
-- 修复：`src/smooth.rs` 的 `SmoothScroll` 在 Scrollable 外层拦截 `WheelScrolled`；`Lines` 发 `Message::Wheel`，按 16 ms tick、0.4 系数缓出到目标（约 150–200 ms）；`Pixels` 发 `Message::WheelPixels` 直接 1:1 滚动，避免触控板二次平滑。
-- 注意：滚动过程中 `scroll_to` 会触发延迟的 `on_scroll`；停止动画的判定阈值放到 80 px，否则上一帧的 offset 会把动画提前掐断。
-- 实测（release tiny-skia）：启动 93 ms、WorkingSet 26.9 MB、exe 5.97 MB 不变；快速滚轮时 CPU 0.83–0.88 核（60 fps 软件渲染的代价），空闲 0.08 核。1 MB 文档滚动 CPU 相同，初始布局仍为 437 ms / 233 MB。
-- 证据：`SUDU_SCROLL_LOG` 记录的 0 → 24.0 → 38.4 → 47.0 → 52.2 → 55.3 → 57.2 → 58.3 → 59.4 → 60.0；录屏 `D:\AI\sudu-target\scroll.mp4` 与 `scroll.gif`。
+- 第一次：iced 0.14 Scrollable 对滚轮 `Lines` 直接 `-movement * 60.0`，每格 60 px 无动画；加了 16 ms 缓出，但对比 Moeka 仍“不跟手”。
+- Moeka（GPUI）的做法：`Cargo.toml` 用 `gpui 0.2.2`，README 明确 GPU / 120Hz / on-demand rendering；`src/editor/input.rs:4553` 的 `on_scroll` 直接 `scroll_offset -= delta_y`（`pixel_delta(line_height)`），没有动画；`src/editor/list_viewport.rs` 只渲染 visible/render/preload 窗口并在上下留 spacer。
+- 素读对应改成：`SmoothScroll` 仍拦截 `WheelScrolled`，但立即 `scroll_to`；`Lines` 步长 = 正文字号 × 行高（约 31 px），`Pixels` 1:1；删除 16 ms 动画订阅和 `AnimTick`。
+- 后端：默认 `backend-wgpu`（GPU，接近 Moeka 的路线）；`backend-tiny` 保留为轻量构建。
+- 实测：wgpu 11.38 MB / 首事件 968 ms / WorkingSet 184 MB / 快速滚轮 CPU 0.03 核；tiny-skia 6.74 MB / 137 ms / 26.8 MB / 0.56 核。两条 exe 都在 `dist\`。
+- 图标：`assets/icons` 使用 iconly 的 `Search_528.svg`（Light-Outline）与 `Setting_530.svg`，侧栏/最小化/最大化/还原/关闭为同风格 16×16 线性 SVG；iced 开启 `svg` feature，用 `svg::Style { color }` 按主题着色。
+
 
 

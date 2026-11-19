@@ -80,3 +80,13 @@ pub fn scroll_to_y(y: f32) -> Task<Message> {
         },
     )
 }
+
+pub fn snap_to_ratio(y: f32) -> Task<Message> {
+    operation::snap_to(
+        body_id(),
+        iced::widget::scrollable::RelativeOffset {
+            x: 0.0,
+            y: y.clamp(0.0, 1.0),
+        },
+    )
+}

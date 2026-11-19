@@ -2,6 +2,7 @@
 #![allow(unused_crate_dependencies)]
 
 mod app;
+mod doc;
 mod offsets;
 mod smooth;
 mod theme;
@@ -15,14 +16,16 @@ fn main() -> iced::Result {
     let probe = std::env::var_os("SUDU_PROBE").map(PathBuf::from);
     let window = iced::window::Settings {
         size: iced::Size::new(1120.0, 820.0),
-        min_size: Some(iced::Size::new(640.0, 480.0)),
+        min_size: Some(iced::Size::new(720.0, 480.0)),
+        decorations: false,
+        resizable: true,
         ..Default::default()
     };
     iced::application(
         move || {
             (
                 app::App::new(initial.clone(), start, probe.clone()),
-                iced::Task::none(),
+                iced::window::latest().map(app::Message::WindowId),
             )
         },
         app::App::update,
