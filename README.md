@@ -10,7 +10,7 @@ Rust + iced 原生窗口 · 无 Electron · 无 WebView · 渲染态原位编辑
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![iced](https://img.shields.io/badge/iced-0.14-blue)
-![platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)
+![platform](https://img.shields.io/badge/platform-Windows%2011%20x64-0078D4)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 [下载](#下载) · [功能](#功能) · [截图](#截图) · [构建](#构建) · [快捷键](#快捷键)
@@ -111,7 +111,7 @@ Rust + [iced](https://github.com/iced-rs/iced) 直接创建原生窗口，没有
 | `sudu-tiny.exe` | 老机器 / 省内存 | 7.0 MB | tiny-skia 软件渲染，启动快、占用低 |
 | `SHA256SUMS.txt` | 校验 | — | 下载后核对 |
 
-Windows 10/11 x64，绿色免安装。exe 未做代码签名，首次运行可能被 SmartScreen 拦截：点「更多信息」→「仍要运行」。介意的话可以自行从源码构建。
+Windows 11 x64，绿色免安装（Windows 10 未单独验证）。exe 未做代码签名，首次运行可能被 SmartScreen 拦截：点「更多信息」→「仍要运行」。介意的话可以自行从源码构建。
 
 ## 构建
 
@@ -184,7 +184,7 @@ cargo build --release --no-default-features --features backend-tiny
 - 图片目前显示 `[图片：alt]` 占位，不加载本地图片。
 - 1 MB 文档仍会一次性构建全部块；虚拟列表待做。
 - 会话恢复、单实例、自动更新未做。
-- 仅在 Windows 10/11 x64 验证；Linux / macOS 未测试。
+- 仅在 Windows 11 x64 验证；Windows 10 / Linux / macOS 未测试。
 
 ## 设计参考与许可
 
