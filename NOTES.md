@@ -74,11 +74,16 @@
 - 实测：wgpu 11.57 MB / 首事件 968 ms / WorkingSet 184 MB / 快速滚轮 CPU 0.03 核；tiny-skia 6.93 MB / 137 ms / 26.8 MB / 0.56 核。两条 exe 都在 `dist\`。
 - 图标：`assets/icons` 使用 iconly 的 `Search_528.svg`（Light-Outline）与 `Setting_530.svg`，侧栏/编辑/保存/最小化/最大化/还原/关闭为同风格线性 SVG；iced 开启 `svg` feature，用 `svg::Style { color }` 按主题着色。
 
-## 编辑（2026-11-19）
+## 渲染态原位编辑（2026-11-20）
 
-- 源码模式：`text_editor::Content::with_text(&doc.source)`；`Action::is_edit()` 才置 dirty（滚动/移动光标不算）；Ctrl+E 或右上角铅笔进入，Ctrl+S 或勾号保存。
-- 保存：有路径直接写；无路径（内置快速入门）弹 `rfd::FileDialog::save_file`；写盘后 `doc::parse` + `doc_rev++` 重新渲染，回阅读并恢复 `edit_ratio`。
-- 未保存时切换文件/快速打开/关闭窗口都拦截，状态栏提示先 Ctrl+S；Esc 在无修改时退出编辑。富文本 / 所见即所得编辑不做。
+- 目标：点铅笔/Ctrl+E 后页面保持渲染，不整页切源码；点击哪一块，只把这一块原位变成编辑区，字体/字号/行高/宽度与阅读视图一致。
+- 源码范围：`Block.span` 记录可编辑范围。标题去掉 `# `、列表去掉 `- `/`1. `、代码块去掉围栏，引用/段落保留内容；保存只替换这段，标记与前缀不动。`doc.rs` 的 `block_span` 负责裁剪。
+- 显示转换：`live.rs` 用 pulldown-cmark 的 offset 事件收集 Strong/Emphasis/Strikethrough/Link/Image/Code 的标记范围，`conceal` 生成“去掉标记的显示文本 + display→source offset map”；粗体/斜体/链接/行内代码用自定义 `MarkHighlighter` 着色。表格行只隐藏首尾管道，内部管道保留，避免在行尾输入把表格写坏。
+- 编辑同步：`text_editor::Content` 持有显示文本；每次 `Action::is_edit()` 用前后文本 diff，经 map 换算成源码范围再 `replace_range`。显示重建后若与编辑器文本不一致（例如刚输入成对标记），重置 Content；普通中文/英文输入不会重置。
+- 块切换：`switch_block` 先把 `block_edits` 合并回 `doc.source` 并 `doc::parse`，再按原块源码位置找到新块打开。这样切走后其他块立即显示最新结果；旧实现从 `doc` 原始 runs 渲染，会把已编辑的列表项“变回去”。
+- 保存：`apply_block_edits` 按原 span 逆序替换，写盘后重新解析、回阅读并恢复 `edit_ratio`；无路径弹保存对话框；未保存切换文件/关闭窗口拦截。
+- 限制（v1）：一次只编辑一块，不能跨块连续选择；链接只能改显示文字；标题级别/表格增删列没有 UI；删除整块格式化文本可能留下空标记（已处理“整块清空”情况）；编辑模式每次输入重建整篇非活动块，超大文档性能待测。
+- 为什么不做 Moeka 式单缓冲：Moeka 的 Edit 模式是自写 GPUI 文本引擎（buffer + LineDecoration + display_text/buffer_to_display/display_to_buffer + 光标映射）。iced 0.14 的 `text_editor` 不暴露光标/选区范围，也只在 Highlighter 里支持颜色和字体，不支持 conceal；要完全复刻必须自写编辑器。当前用“每块一个 text_editor + 标记隐藏”逼近，风险与代码量可控。
 
 ## 保存与完整性标签（2026-11-19）
 

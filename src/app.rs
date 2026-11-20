@@ -1,4 +1,5 @@
 use crate::doc::{self, Block, BlockKind, Doc, Link, TextMatch};
+use crate::live;
 use crate::offsets;
 use crate::theme::{self, Palette, Theme};
 use iced::alignment::{Horizontal, Vertical};
@@ -66,6 +67,13 @@ pub struct QuickState {
     pub query: String,
 }
 
+struct LiveEdit {
+    block: usize,
+    content: text_editor::Content,
+    source: String,
+    display: live::Display,
+}
+
 #[derive(Clone)]
 pub enum Message {
     NextTheme,
@@ -75,6 +83,7 @@ pub enum Message {
     ToggleSidebar,
     ToggleSettings,
     ToggleEdit,
+    EditBlock(usize),
     EditorAction(text_editor::Action),
     Save,
     CloseSettings,
@@ -127,7 +136,8 @@ pub struct App {
     sidebar_open: bool,
     settings_open: bool,
     editing: bool,
-    editor: Option<text_editor::Content>,
+    live: Option<LiveEdit>,
+    block_edits: HashMap<usize, String>,
     dirty: bool,
     edit_ratio: f32,
     about_open: bool,
@@ -178,7 +188,8 @@ impl App {
             sidebar_open: false,
             settings_open: false,
             editing: false,
-            editor: None,
+            live: None,
+            block_edits: HashMap::new(),
             dirty: false,
             edit_ratio: 0.0,
             about_open: false,
@@ -272,12 +283,46 @@ impl App {
                     self.begin_edit()
                 }
             }
+            Message::EditBlock(index) => self.switch_block(index),
             Message::EditorAction(action) => {
-                if let Some(editor) = self.editor.as_mut() {
-                    if action.is_edit() {
-                        self.dirty = true;
+                let style = self.style_set();
+                let kind = self
+                    .live
+                    .as_ref()
+                    .and_then(|live| self.doc.blocks.get(live.block))
+                    .map(|block| block.kind.clone());
+                let Some(kind) = kind else {
+                    return Task::none();
+                };
+                let Some(live) = self.live.as_mut() else {
+                    return Task::none();
+                };
+                let edit = action.is_edit();
+                let before = live.content.text();
+                live.content.perform(action);
+                let after = live.content.text();
+                let mut updated = None;
+                if edit && before != after {
+                    let mut source = live.source.clone();
+                    let changed = if after.is_empty() {
+                        source.clear();
+                        true
+                    } else {
+                        live::apply(&mut source, &live.display.map, &before, &after)
+                    };
+                    if changed {
+                        let display = live::build(&source, &kind, &style);
+                        if display.text != after {
+                            live.content = text_editor::Content::with_text(&display.text);
+                        }
+                        live.source = source;
+                        live.display = display;
+                        updated = Some((live.block, live.source.clone()));
                     }
-                    editor.perform(action);
+                }
+                if let Some((block, source)) = updated {
+                    self.block_edits.insert(block, source);
+                    self.dirty = true;
                 }
                 Task::none()
             }
@@ -512,7 +557,8 @@ impl App {
                         self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存"));
                     } else {
                         self.editing = false;
-                        self.editor = None;
+                        self.live = None;
+                        self.block_edits.clear();
                     }
                 }
                 Task::none()
@@ -579,23 +625,132 @@ impl App {
         }
     }
 
+    fn style_set(&self) -> live::StyleSet {
+        let theme = theme::all()[self.theme_idx].clone();
+        live::StyleSet {
+            body: theme.body,
+            heading: Font {
+                weight: iced::font::Weight::Bold,
+                ..theme.body
+            },
+            mono: theme.mono,
+            text: theme.pal.text,
+            muted: theme.pal.muted,
+            accent: theme.pal.accent,
+        }
+    }
+
+    fn open_block(&mut self, index: usize) -> Task<Message> {
+        if !self.editing {
+            return Task::none();
+        }
+        if self.live.as_ref().is_some_and(|live| live.block == index) {
+            return operation::focus(editor_id());
+        }
+        let Some(block) = self.doc.blocks.get(index) else {
+            return Task::none();
+        };
+        if matches!(block.kind, BlockKind::Rule) {
+            return Task::none();
+        }
+        let source = self
+            .block_edits
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| self.doc.source[block.span.clone()].to_string());
+        let display = live::build(&source, &block.kind, &self.style_set());
+        self.live = Some(LiveEdit {
+            block: index,
+            content: text_editor::Content::with_text(&display.text),
+            source,
+            display,
+        });
+        operation::focus(editor_id())
+    }
+
+    fn switch_block(&mut self, index: usize) -> Task<Message> {
+        let Some(block) = self.doc.blocks.get(index) else {
+            return Task::none();
+        };
+        let target_start = block.span.start;
+        if self.block_edits.is_empty() {
+            return self.open_block(index);
+        }
+        let mut shift = 0i64;
+        for (&edited, text) in &self.block_edits {
+            if let Some(block) = self.doc.blocks.get(edited) {
+                if block.span.end <= target_start {
+                    shift += text.len() as i64 - block.span.len() as i64;
+                }
+            }
+        }
+        let source = self.apply_block_edits();
+        let parsed = doc::parse(&source, self.path.as_deref());
+        self.doc = Arc::new(parsed);
+        self.doc_rev += 1;
+        self.block_edits.clear();
+        self.offsets.clear();
+        self.current_heading = None;
+        let target = (target_start as i64 + shift).max(0) as usize;
+        let next = self
+            .doc
+            .blocks
+            .iter()
+            .position(|block| block.span.start <= target && target <= block.span.end)
+            .or_else(|| {
+                self.doc
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, block)| block.span.start.abs_diff(target))
+                    .map(|(index, _)| index)
+            })
+            .unwrap_or(index);
+        self.open_block(next.min(self.doc.blocks.len().saturating_sub(1)))
+    }
+
     fn begin_edit(&mut self) -> Task<Message> {
         self.edit_ratio = self.scroll_ratio;
-        self.editor = Some(text_editor::Content::with_text(&self.doc.source));
         self.editing = true;
         self.dirty = false;
+        self.live = None;
+        self.block_edits.clear();
         self.find_open = false;
         self.settings_open = false;
         self.quick = None;
         self.notice = None;
-        Task::none()
+        match self
+            .doc
+            .blocks
+            .iter()
+            .position(|block| !matches!(block.kind, BlockKind::Rule))
+        {
+            Some(index) => self.open_block(index),
+            None => Task::none(),
+        }
+    }
+
+    fn apply_block_edits(&self) -> String {
+        let mut source = self.doc.source.clone();
+        let mut edits: Vec<(usize, usize, &str)> = self
+            .block_edits
+            .iter()
+            .filter_map(|(&index, text)| {
+                self.doc
+                    .blocks
+                    .get(index)
+                    .map(|block| (block.span.start, block.span.end, text.as_str()))
+            })
+            .collect();
+        edits.sort_by_key(|edit| edit.0);
+        for (start, end, text) in edits.into_iter().rev() {
+            source.replace_range(start..end, text);
+        }
+        source
     }
 
     fn save_and_finish(&mut self) -> Task<Message> {
-        let Some(text) = self.editor.as_ref().map(|editor| editor.text()) else {
-            self.editing = false;
-            return Task::none();
-        };
+        let source = self.apply_block_edits();
         let path = match self.path.clone() {
             Some(path) => path,
             None => match rfd::FileDialog::new()
@@ -607,11 +762,11 @@ impl App {
                 None => return Task::none(),
             },
         };
-        if let Err(error) = std::fs::write(&path, &text) {
+        if let Err(error) = std::fs::write(&path, &source) {
             self.notice = Some(format!("保存失败：{error}"));
             return Task::none();
         }
-        let parsed = doc::parse(&text, Some(&path));
+        let parsed = doc::parse(&source, Some(&path));
         self.doc = Arc::new(parsed);
         self.path = Some(path.clone());
         if self.root.is_none() {
@@ -627,7 +782,8 @@ impl App {
         self.current_match = None;
         self.search_rev += 1;
         self.editing = false;
-        self.editor = None;
+        self.live = None;
+        self.block_edits.clear();
         self.dirty = false;
         self.notice = Some(String::from("已保存"));
         self.scroll_ratio = self.edit_ratio;
@@ -768,7 +924,8 @@ impl App {
                 self.quick = None;
                 self.notice = None;
                 self.editing = false;
-                self.editor = None;
+                self.live = None;
+                self.block_edits.clear();
                 self.dirty = false;
                 self.anim_current = 0.0;
                 self.scroll_ratio = ratio.unwrap_or(0.0);
@@ -1041,50 +1198,12 @@ impl App {
     }
 
     fn content(&self, t: &Theme, pal: Palette) -> Element<'_, Message> {
-        if self.editing {
-            if let Some(editor) = &self.editor {
-                let width = self.content_width(t.width);
-                let editor = text_editor(editor)
-                    .on_action(Message::EditorAction)
-                    .font(t.mono)
-                    .size(t.size * self.font_scale * 0.95)
-                    .line_height(LineHeight::Relative(1.65))
-                    .padding(Padding::from([20.0, 16.0]))
-                    .height(Length::Fill)
-                    .style(move |_, _| text_editor::Style {
-                        background: pal.bg.into(),
-                        border: Border::default(),
-                        placeholder: pal.muted,
-                        value: pal.text,
-                        selection: pal.selection,
-                    });
-                let paper = container(editor)
-                    .width(Length::Fixed(width))
-                    .height(Length::Fill)
-                    .style(move |_| container::Style {
-                        background: Some(pal.bg.into()),
-                        border: Border {
-                            color: pal.border,
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    });
-                return container(paper)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding(Padding {
-                        top: 16.0,
-                        right: 0.0,
-                        bottom: 16.0,
-                        left: 0.0,
-                    })
-                    .into();
-            }
-        }
         let width = self.content_width(t.width);
-        let body = iced::widget::lazy(self.body_key(t), |key| render_body(key));
+        let body: Element<'_, Message> = if self.editing {
+            self.live_body(t, pal)
+        } else {
+            iced::widget::lazy(self.body_key(t), |key| render_body(key)).into()
+        };
         let paper = container(body)
             .width(Length::Fixed(width))
             .padding(Padding {
@@ -1107,6 +1226,118 @@ impl App {
         } else {
             base
         }
+    }
+
+    fn live_body(&self, t: &Theme, _pal: Palette) -> Element<'_, Message> {
+        let key = self.body_key(t);
+        let mut column = Column::new().spacing(8).width(Length::Fill);
+        for (index, block) in self.doc.blocks.iter().enumerate() {
+            let view = if self.live.as_ref().is_some_and(|live| live.block == index) {
+                self.live_block_view(&key, index, block)
+            } else {
+                let view = block_view(&key, index, block);
+                if matches!(block.kind, BlockKind::Rule) {
+                    view
+                } else {
+                    let overlay = mouse_area(
+                        container(Space::new())
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    )
+                    .on_press(Message::EditBlock(index))
+                    .interaction(iced::mouse::Interaction::Text);
+                    stack(vec![view, overlay.into()]).into()
+                }
+            };
+            column = column.push(view);
+        }
+        column.into()
+    }
+
+    fn live_block_view<'a>(
+        &'a self,
+        key: &BodyKey,
+        index: usize,
+        block: &'a Block,
+    ) -> Element<'a, Message> {
+        let Some(live) = self.live.as_ref() else {
+            return block_view(key, index, block);
+        };
+        let pal = key.data.pal;
+        let size = block_size(key, &block.kind);
+        let line = match block.kind {
+            BlockKind::Code => 1.55,
+            BlockKind::Heading(_) => 1.35,
+            _ => key.data.line,
+        };
+        let heading = matches!(block.kind, BlockKind::Heading(_));
+        let code = matches!(block.kind, BlockKind::Code | BlockKind::TableRow { .. });
+        let quote = matches!(block.kind, BlockKind::Quote);
+        let font = if code {
+            key.data.mono_font
+        } else if heading {
+            Font {
+                weight: iced::font::Weight::Bold,
+                ..key.data.body_font
+            }
+        } else {
+            key.data.body_font
+        };
+        let value = if quote { pal.muted } else { pal.text };
+        let editor = text_editor(&live.content)
+            .id(editor_id())
+            .on_action(Message::EditorAction)
+            .font(font)
+            .size(size)
+            .line_height(LineHeight::Relative(line))
+            .padding(Padding::from([0.0, 0.0]))
+            .height(Length::Shrink)
+            .highlight_with::<live::MarkHighlighter>(live.display.settings(), live::format)
+            .style(move |_, _| text_editor::Style {
+                background: Color::TRANSPARENT.into(),
+                border: Border::default(),
+                placeholder: pal.muted,
+                value,
+                selection: pal.selection,
+            });
+        let inner: Element<'a, Message> = if let BlockKind::ListItem { marker, .. } = &block.kind {
+            row![
+                text(marker.clone())
+                    .size(size)
+                    .font(key.data.body_font)
+                    .color(pal.muted),
+                editor
+            ]
+            .spacing(6)
+            .into()
+        } else {
+            editor.into()
+        };
+        let is_header = matches!(block.kind, BlockKind::TableRow { header: true });
+        let background = if code || is_header {
+            Some(pal.code_bg.into())
+        } else {
+            None
+        };
+        let border = if matches!(block.kind, BlockKind::Code) {
+            Border {
+                color: pal.border,
+                width: 1.0,
+                radius: 4.0.into(),
+            }
+        } else {
+            Border::default()
+        };
+        container(inner)
+            .id(block.id.clone())
+            .padding(block_padding(&block.kind))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background,
+                border,
+                ..Default::default()
+            })
+            .into()
     }
 
     fn find_bar(&self, _t: &Theme, pal: Palette) -> Element<'_, Message> {
@@ -1407,9 +1638,9 @@ impl App {
             format!("{} 字", self.doc.words)
         };
         let lines = if self.editing {
-            self.editor
+            self.live
                 .as_ref()
-                .map(|editor| format!("{} 行", editor.line_count()))
+                .map(|live| format!("{} 行", live.content.line_count()))
                 .unwrap_or_default()
         } else {
             format!("{} 行", self.doc.lines)
@@ -1569,6 +1800,10 @@ fn key_event(
 
 fn find_input_id() -> iced::widget::Id {
     iced::widget::Id::new("find-input")
+}
+
+fn editor_id() -> iced::widget::Id {
+    iced::widget::Id::new("live-editor")
 }
 
 fn quick_input_id() -> iced::widget::Id {
@@ -1942,7 +2177,37 @@ fn block_view(key: &BodyKey, index: usize, block: &Block) -> Element<'static, Me
             selection,
         });
     let rich: Element<'static, Message> = rich.into();
-    let pad = match block.kind {
+    let pad = block_padding(&block.kind);
+    let is_code = matches!(block.kind, BlockKind::Code);
+    let is_header = matches!(block.kind, BlockKind::TableRow { header: true });
+    let bg = if is_code || is_header {
+        Some(pal.code_bg.into())
+    } else {
+        None
+    };
+    let border = if is_code {
+        Border {
+            color: pal.border,
+            width: 1.0,
+            radius: 4.0.into(),
+        }
+    } else {
+        Border::default()
+    };
+    container(rich)
+        .id(block.id.clone())
+        .padding(pad)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: bg,
+            border,
+            ..Default::default()
+        })
+        .into()
+}
+
+fn block_padding(kind: &BlockKind) -> Padding {
+    match kind {
         BlockKind::Heading(1) => Padding {
             top: 14.0,
             right: 0.0,
@@ -1983,7 +2248,7 @@ fn block_view(key: &BodyKey, index: usize, block: &Block) -> Element<'static, Me
             top: 2.0,
             right: 0.0,
             bottom: 2.0,
-            left: 8.0 + indent as f32 * 18.0,
+            left: 8.0 + *indent as f32 * 18.0,
         },
         BlockKind::TableRow { .. } => Padding {
             top: 3.0,
@@ -1992,33 +2257,7 @@ fn block_view(key: &BodyKey, index: usize, block: &Block) -> Element<'static, Me
             left: 8.0,
         },
         _ => Padding::from(0.0),
-    };
-    let is_code = matches!(block.kind, BlockKind::Code);
-    let is_header = matches!(block.kind, BlockKind::TableRow { header: true });
-    let bg = if is_code || is_header {
-        Some(pal.code_bg.into())
-    } else {
-        None
-    };
-    let border = if is_code {
-        Border {
-            color: pal.border,
-            width: 1.0,
-            radius: 4.0.into(),
-        }
-    } else {
-        Border::default()
-    };
-    container(rich)
-        .id(block.id.clone())
-        .padding(pad)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: bg,
-            border,
-            ..Default::default()
-        })
-        .into()
+    }
 }
 
 fn block_size(key: &BodyKey, kind: &BlockKind) -> f32 {

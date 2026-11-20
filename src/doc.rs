@@ -1,5 +1,6 @@
 use iced::widget::Id as WidgetId;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct Block {
     pub kind: BlockKind,
     pub runs: Vec<Run>,
     pub plain: String,
+    pub span: Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,9 +90,9 @@ pub fn parse(text: &str, path: Option<&Path>) -> Doc {
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS,
     );
-    let mut builder = Builder::new(path);
-    for event in Parser::new_ext(text, options) {
-        builder.event(event);
+    let mut builder = Builder::new(path, text);
+    for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
+        builder.event(event, range);
     }
     builder.finish_all(text)
 }
@@ -100,8 +102,80 @@ struct ListState {
     next: u64,
 }
 
+fn block_span(source: &str, kind: &BlockKind, start: usize, end: usize) -> Range<usize> {
+    let bytes = source.as_bytes();
+    let mut end = end.max(start).min(source.len());
+    while end > start && matches!(bytes[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    let start = start.min(end);
+    match kind {
+        BlockKind::Heading(level) => {
+            let mut pos = start;
+            for _ in 0..*level {
+                if bytes.get(pos) == Some(&b'#') {
+                    pos += 1;
+                }
+            }
+            if bytes.get(pos) == Some(&b' ') {
+                pos += 1;
+            }
+            pos.min(end)..end
+        }
+        BlockKind::ListItem { .. } => {
+            let mut pos = start;
+            while pos < end && bytes[pos] == b' ' {
+                pos += 1;
+            }
+            let marker_end = match bytes.get(pos).copied() {
+                Some(b'-' | b'*' | b'+') if bytes.get(pos + 1) == Some(&b' ') => Some(pos + 2),
+                Some(b'0'..=b'9') => {
+                    let mut digits = pos;
+                    while digits < end && bytes[digits].is_ascii_digit() {
+                        digits += 1;
+                    }
+                    match bytes.get(digits).copied() {
+                        Some(b'.' | b')') if bytes.get(digits + 1) == Some(&b' ') => {
+                            Some(digits + 2)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            marker_end.unwrap_or(start).min(end)..end
+        }
+        BlockKind::Code => {
+            let text = &source[start..end];
+            let mut body_start = start;
+            if let Some(newline) = text.find('\n') {
+                let first = text[..newline].trim();
+                if first.starts_with("```") || first.starts_with("~~~") {
+                    body_start = start + newline + 1;
+                }
+            }
+            let body = &source[body_start..end];
+            let mut body_end = end;
+            if let Some(newline) = body.rfind('\n') {
+                let last = body[newline + 1..].trim();
+                if last.starts_with("```") || last.starts_with("~~~") {
+                    body_end = body_start + newline;
+                }
+            } else {
+                let last = body.trim();
+                if last.starts_with("```") || last.starts_with("~~~") {
+                    body_end = body_start;
+                }
+            }
+            body_start..body_end.max(body_start)
+        }
+        _ => start..end,
+    }
+}
+
 struct Builder<'a> {
     path: Option<&'a Path>,
+    source: &'a str,
     blocks: Vec<Block>,
     headings: Vec<Heading>,
     runs: Vec<Run>,
@@ -117,12 +191,15 @@ struct Builder<'a> {
     link: Option<Link>,
     code_text: String,
     image_alt: Option<String>,
+    block_start: usize,
+    block_end: usize,
 }
 
 impl<'a> Builder<'a> {
-    fn new(path: Option<&'a Path>) -> Self {
+    fn new(path: Option<&'a Path>, source: &'a str) -> Self {
         Self {
             path,
+            source,
             blocks: Vec::new(),
             headings: Vec::new(),
             runs: Vec::new(),
@@ -138,10 +215,12 @@ impl<'a> Builder<'a> {
             link: None,
             code_text: String::new(),
             image_alt: None,
+            block_start: 0,
+            block_end: 0,
         }
     }
 
-    fn event(&mut self, event: Event<'_>) {
+    fn event(&mut self, event: Event<'_>, range: Range<usize>) {
         if self.metadata > 0 {
             match event {
                 Event::Start(Tag::MetadataBlock(_)) | Event::Start(Tag::HtmlBlock) => {
@@ -156,31 +235,48 @@ impl<'a> Builder<'a> {
         }
 
         match event {
-            Event::Start(tag) => self.start_tag(tag),
-            Event::End(tag) => self.end_tag(tag),
+            Event::Start(tag) => self.start_tag(tag, range.start),
+            Event::End(tag) => {
+                self.block_end = range.end;
+                self.end_tag(tag);
+            }
             Event::Text(text) => {
                 if let Some(alt) = self.image_alt.as_mut() {
                     alt.push_str(&text);
                 } else {
-                    self.push_text(&text);
+                    self.push_text(&text, range.start);
                 }
             }
-            Event::Code(text) => self.push_run(&text, true),
-            Event::SoftBreak => self.push_text(" "),
-            Event::HardBreak => self.push_text("\n"),
+            Event::Code(text) => {
+                self.ensure_start(range.start);
+                self.push_run(&text, true);
+            }
+            Event::SoftBreak => self.push_text(" ", range.start),
+            Event::HardBreak => self.push_text("\n", range.start),
             Event::Rule => {
                 self.finish();
-                self.push_block(BlockKind::Rule, Vec::new());
+                self.push_block(BlockKind::Rule, Vec::new(), range);
             }
             Event::TaskListMarker(checked) => {
-                self.push_text(if checked { "[x] " } else { "[ ] " });
+                self.push_text(if checked { "[x] " } else { "[ ] " }, range.start);
             }
             Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) => {}
             _ => {}
         }
     }
 
-    fn start_tag(&mut self, tag: Tag<'_>) {
+    fn ensure_start(&mut self, start: usize) {
+        if !self.started {
+            let kind = if self.quote > 0 {
+                BlockKind::Quote
+            } else {
+                BlockKind::Paragraph
+            };
+            self.start(kind, start);
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>, start: usize) {
         match tag {
             Tag::Paragraph => {
                 if !self.started {
@@ -189,16 +285,16 @@ impl<'a> Builder<'a> {
                     } else {
                         BlockKind::Paragraph
                     };
-                    self.start(kind);
+                    self.start(kind, start);
                 }
             }
             Tag::Heading { level, .. } => {
                 self.finish();
-                self.start(BlockKind::Heading(heading_level(level)));
+                self.start(BlockKind::Heading(heading_level(level)), start);
             }
             Tag::CodeBlock(_) => {
                 self.finish();
-                self.start(BlockKind::Code);
+                self.start(BlockKind::Code, start);
                 self.code_text.clear();
             }
             Tag::BlockQuote(_) => {
@@ -222,7 +318,7 @@ impl<'a> Builder<'a> {
                     }
                     _ => String::from("• "),
                 };
-                self.start(BlockKind::ListItem { indent, marker });
+                self.start(BlockKind::ListItem { indent, marker }, start);
             }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
@@ -238,13 +334,16 @@ impl<'a> Builder<'a> {
             Tag::TableHead => {
                 self.finish();
                 self.table_header = true;
-                self.start(BlockKind::TableRow { header: true });
+                self.start(BlockKind::TableRow { header: true }, start);
             }
             Tag::TableRow => {
                 self.finish();
-                self.start(BlockKind::TableRow {
-                    header: self.table_header,
-                });
+                self.start(
+                    BlockKind::TableRow {
+                        header: self.table_header,
+                    },
+                    start,
+                );
             }
             Tag::TableCell => {
                 if self.started && !self.runs.is_empty() {
@@ -282,10 +381,11 @@ impl<'a> Builder<'a> {
             TagEnd::Image => {
                 if let Some(alt) = self.image_alt.take() {
                     let label = alt.trim();
+                    let at = self.block_start;
                     if label.is_empty() {
-                        self.push_text("[图片]");
+                        self.push_text("[图片]", at);
                     } else {
-                        self.push_text(&format!("[图片：{label}]"));
+                        self.push_text(&format!("[图片：{label}]"), at);
                     }
                 }
             }
@@ -302,28 +402,24 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn start(&mut self, kind: BlockKind) {
+    fn start(&mut self, kind: BlockKind, start: usize) {
         if self.started {
+            self.block_end = start;
             self.finish();
         }
         self.kind = kind;
         self.started = true;
         self.runs.clear();
         self.code_text.clear();
+        self.block_start = start;
+        self.block_end = start;
     }
 
-    fn push_text(&mut self, text: &str) {
+    fn push_text(&mut self, text: &str, start: usize) {
         if self.metadata > 0 || text.is_empty() {
             return;
         }
-        if !self.started {
-            let kind = if self.quote > 0 {
-                BlockKind::Quote
-            } else {
-                BlockKind::Paragraph
-            };
-            self.start(kind);
-        }
+        self.ensure_start(start);
         if matches!(self.kind, BlockKind::Code) {
             self.code_text.push_str(text);
         } else {
@@ -367,6 +463,7 @@ impl<'a> Builder<'a> {
         }
         self.started = false;
         let kind = std::mem::replace(&mut self.kind, BlockKind::Paragraph);
+        let span = block_span(self.source, &kind, self.block_start, self.block_end);
         let mut runs = std::mem::take(&mut self.runs);
         if matches!(kind, BlockKind::Code) {
             let text = std::mem::take(&mut self.code_text);
@@ -392,6 +489,7 @@ impl<'a> Builder<'a> {
             kind,
             runs,
             plain,
+            span,
         });
         if let Some((level, text)) = heading {
             let base = slugify(&text);
@@ -410,7 +508,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn push_block(&mut self, kind: BlockKind, runs: Vec<Run>) {
+    fn push_block(&mut self, kind: BlockKind, runs: Vec<Run>, span: Range<usize>) {
         let index = self.blocks.len();
         let plain = runs.iter().map(|run| run.text.as_str()).collect::<String>();
         self.blocks.push(Block {
@@ -418,6 +516,7 @@ impl<'a> Builder<'a> {
             kind,
             runs,
             plain,
+            span,
         });
     }
 
@@ -617,6 +716,18 @@ mod tests {
         let doc = parse("Hello 世界 hello\n", None);
         let matches = find_matches(&doc, "hello");
         assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn blocks_expose_editable_source_spans() {
+        let source = "# 标题 **粗**\n\n- 项目一\n\n> 引用\n\n```rs\nlet x = 1;\n```\n";
+        let doc = parse(source, None);
+        let slices: Vec<&str> = doc
+            .blocks
+            .iter()
+            .map(|block| &source[block.span.clone()])
+            .collect();
+        assert_eq!(slices, vec!["标题 **粗**", "项目一", "引用", "let x = 1;"]);
     }
 
     #[test]

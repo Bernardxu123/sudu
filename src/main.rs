@@ -3,6 +3,7 @@
 
 mod app;
 mod doc;
+mod live;
 mod offsets;
 mod smooth;
 mod theme;
