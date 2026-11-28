@@ -1,19 +1,22 @@
-use crate::doc::{self, Block, BlockKind, Doc, Link, TextMatch};
-use crate::live;
+use crate::doc::{self, BlockKind, Doc, Link, TextMatch};
+use crate::doc_widget::{DocAction, DocWidget, SearchView};
+use crate::editor::{clamp_pos, DocPos, EditorState, FormatKind, TableOp};
+use crate::images::ImageStore;
 use crate::offsets;
+use crate::session::{self, Session};
+use crate::table::CellAlign;
 use crate::theme::{self, Palette, Theme};
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::button::Button;
-use iced::widget::text::{LineHeight, Wrapping};
+use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, column, container, mouse_area, operation, row, scrollable, span, stack, svg, text,
-    text_editor, text_input, Column, Space,
+    button, column, container, mouse_area, operation, row, scrollable, stack, svg, text,
+    text_input, Column, Row, Space,
 };
-use iced::{Alignment, Border, Color, Element, Font, Length, Padding, Shadow, Size, Task};
+use iced::{Alignment, Border, Color, Element, Length, Padding, Point, Shadow, Size, Task};
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,55 +26,10 @@ const STATUS_HEIGHT: f32 = 26.0;
 const MIN_CONTENT: f32 = 420.0;
 
 #[derive(Clone)]
-pub struct BodyData {
-    pub doc: Arc<Doc>,
-    pub pal: Palette,
-    pub body_font: Font,
-    pub mono_font: Font,
-    pub size: f32,
-    pub line: f32,
-    pub search: Option<Arc<SearchView>>,
-    pub renders: Arc<AtomicU32>,
-}
-
-#[derive(Clone)]
-pub struct SearchView {
-    pub matches: Arc<Vec<TextMatch>>,
-    pub current: Option<usize>,
-}
-
-#[derive(Clone)]
-pub struct BodyKey {
-    pub data: Arc<BodyData>,
-    pub doc_rev: u64,
-    pub theme: u8,
-    pub size_q: u16,
-    pub line_q: u16,
-    pub search_rev: u64,
-}
-
-impl Hash for BodyKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.doc_rev.hash(state);
-        self.theme.hash(state);
-        self.size_q.hash(state);
-        self.line_q.hash(state);
-        self.search_rev.hash(state);
-    }
-}
-
-#[derive(Clone)]
 pub struct QuickState {
     pub root: PathBuf,
     pub files: Arc<Vec<PathBuf>>,
     pub query: String,
-}
-
-struct LiveEdit {
-    block: usize,
-    content: text_editor::Content,
-    source: String,
-    display: live::Display,
 }
 
 #[derive(Clone)]
@@ -83,8 +41,6 @@ pub enum Message {
     ToggleSidebar,
     ToggleSettings,
     ToggleEdit,
-    EditBlock(usize),
-    EditorAction(text_editor::Action),
     Save,
     CloseSettings,
     ToggleAbout,
@@ -104,15 +60,25 @@ pub enum Message {
     Resize(iced::window::Direction),
     WindowId(Option<iced::window::Id>),
     WindowOpened(iced::window::Id, Size),
+    WindowMoved(Point),
     WindowResized(Size),
-    WindowCloseRequested,
+    WindowCloseRequested(iced::window::Id),
     Measure,
-    Offsets(HashMap<usize, f32>),
+    Offsets {
+        map: HashMap<usize, f32>,
+        target_y: Option<f32>,
+        visible_block: Option<usize>,
+    },
     Jump(usize),
-    Link(Link),
     Scroll(scrollable::Viewport),
     Wheel(f32),
     WheelPixels(f32),
+    PageUp,
+    PageDown,
+    ScrollHome,
+    ScrollEnd,
+    LineUp,
+    LineDown,
     ProbeFrame,
     QuickInput(String),
     QuickOpen(PathBuf),
@@ -123,23 +89,27 @@ pub enum Message {
     KeyShiftEnter,
     KeyF3,
     KeyShiftF3,
+    ShiftChanged(bool),
+    Doc(DocAction),
     Noop,
 }
 
 pub struct App {
     doc: Arc<Doc>,
     doc_rev: u64,
+    edited_block: Option<usize>,
+    materialize_hint: Option<usize>,
+    images: Arc<ImageStore>,
     path: Option<PathBuf>,
     root: Option<PathBuf>,
+    session: Session,
     theme_idx: usize,
     font_scale: f32,
     sidebar_open: bool,
     settings_open: bool,
     editing: bool,
-    live: Option<LiveEdit>,
-    block_edits: HashMap<usize, String>,
-    dirty: bool,
-    edit_ratio: f32,
+    editor: EditorState,
+    pending_edit_focus: bool,
     about_open: bool,
     find_open: bool,
     find_input: String,
@@ -158,40 +128,95 @@ pub struct App {
     quick: Option<QuickState>,
     window_id: Option<iced::window::Id>,
     window_size: Size,
+    window_pos: Option<Point>,
     maximized: bool,
+    shift_held: bool,
     start: Instant,
     probe: Option<PathBuf>,
     renders: Arc<AtomicU32>,
 }
 
 impl App {
-    pub fn new(initial: Option<PathBuf>, start: Instant, probe: Option<PathBuf>) -> Self {
-        let (text_doc, path, notice) = match initial.as_deref() {
+    pub fn new(
+        initial: Option<PathBuf>,
+        restored: Session,
+        start: Instant,
+        probe: Option<PathBuf>,
+    ) -> (Self, Task<Message>) {
+        let mut notice = None;
+        let mut initial_ratio = 0.0f32;
+        let (text_doc, path) = match initial.as_deref() {
             Some(path) => match doc::load(path) {
-                Ok(loaded) => (loaded, Some(path.to_path_buf()), None),
-                Err(error) => (doc::quickstart(), None, Some(error)),
+                Ok(loaded) => {
+                    initial_ratio = restored.ratio_for(path).unwrap_or(0.0);
+                    (loaded, Some(path.to_path_buf()))
+                }
+                Err(error) => {
+                    notice = Some(error);
+                    (doc::quickstart(), None)
+                }
             },
-            None => (doc::quickstart(), None, None),
+            None => {
+                let candidate = if std::env::var_os("SUDU_NO_SESSION").is_none() {
+                    restored
+                        .last_path
+                        .as_deref()
+                        .map(PathBuf::from)
+                        .filter(|p| p.exists())
+                } else {
+                    None
+                };
+                if let Some(last) = candidate {
+                    match doc::load(&last) {
+                        Ok(loaded) => {
+                            initial_ratio = restored
+                                .ratio_for(&last)
+                                .unwrap_or(restored.scroll_ratio);
+                            (loaded, Some(last))
+                        }
+                        Err(error) => {
+                            notice = Some(error);
+                            (doc::quickstart(), None)
+                        }
+                    }
+                } else {
+                    (doc::quickstart(), None)
+                }
+            }
         };
-        let theme_idx = std::env::var("SUDU_THEME")
+
+        let env_theme = std::env::var("SUDU_THEME")
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0)
-            % 4;
-        Self {
+            .and_then(|value| value.parse::<usize>().ok());
+        let theme_idx = env_theme.unwrap_or(restored.theme_idx) % 4;
+        let font_scale = restored.font_scale.clamp(0.8, 1.6);
+        let sidebar_open = restored.sidebar_open;
+        let window_size = Size::new(
+            restored.window_size[0].clamp(720.0, 3840.0),
+            restored.window_size[1].clamp(480.0, 2160.0),
+        );
+        let window_pos = restored.window_pos.map(|[x, y]| Point::new(x, y));
+        let maximized = restored.maximized;
+
+        let mut editor = EditorState::new();
+        editor.reset(&text_doc);
+
+        let app = Self {
             doc: Arc::new(text_doc),
             doc_rev: 1,
+            edited_block: None,
+            materialize_hint: None,
+            images: Arc::new(ImageStore::new()),
             path,
             root: None,
+            session: restored,
             theme_idx,
-            font_scale: 1.0,
-            sidebar_open: false,
+            font_scale,
+            sidebar_open,
             settings_open: false,
             editing: false,
-            live: None,
-            block_edits: HashMap::new(),
-            dirty: false,
-            edit_ratio: 0.0,
+            editor,
+            pending_edit_focus: false,
             about_open: false,
             find_open: false,
             find_input: String::new(),
@@ -203,22 +228,40 @@ impl App {
             pending_jump: None,
             pending_anchor: None,
             viewport: None,
-            scroll_ratio: 0.0,
+            scroll_ratio: initial_ratio.clamp(0.0, 1.0),
             anim_current: 0.0,
             notice,
             last_link: None,
             quick: None,
             window_id: None,
-            window_size: Size::new(1120.0, 820.0),
-            maximized: false,
+            window_size,
+            window_pos,
+            maximized,
+            shift_held: false,
             start,
             probe,
             renders: Arc::new(AtomicU32::new(0)),
-        }
+        };
+
+        let task = if initial_ratio > 0.001 {
+            offsets::snap_to_ratio(initial_ratio)
+        } else {
+            Task::none()
+        };
+        (app, task)
+    }
+
+    pub fn enter_edit_on_start(&mut self) {
+        self.editing = true;
+        self.editor.clamp(&self.doc);
     }
 
     pub fn title(&self) -> String {
-        format!("素读 — {}", self.source_name())
+        if self.editor.dirty {
+            format!("素读 — {} *", self.source_name())
+        } else {
+            format!("素读 — {}", self.source_name())
+        }
     }
 
     pub fn theme(&self) -> iced::Theme {
@@ -248,27 +291,32 @@ impl App {
         match message {
             Message::NextTheme => {
                 self.theme_idx = (self.theme_idx + 1) % 4;
-                self.after_metrics_change()
+                self.persist_session();
+                self.measure()
             }
             Message::SetTheme(index) => {
                 if index < 4 {
                     self.theme_idx = index;
                 }
-                self.after_metrics_change()
+                self.persist_session();
+                self.measure()
             }
             Message::FontInc => {
                 self.font_scale = (self.font_scale + 0.05).min(1.6);
+                self.persist_session();
                 self.after_metrics_change()
             }
             Message::FontDec => {
                 self.font_scale = (self.font_scale - 0.05).max(0.8);
+                self.persist_session();
                 self.after_metrics_change()
             }
             Message::ToggleSidebar => {
                 self.sidebar_open = !self.sidebar_open;
                 self.offsets.clear();
                 self.current_heading = None;
-                offsets::snap_to_ratio(self.scroll_ratio)
+                self.persist_session();
+                self.measure()
             }
             Message::ToggleSettings => {
                 self.settings_open = !self.settings_open;
@@ -278,61 +326,18 @@ impl App {
             }
             Message::ToggleEdit => {
                 if self.editing {
-                    self.save_and_finish()
+                    if self.editor.dirty {
+                        self.save_doc(true)
+                    } else {
+                        self.editing = false;
+                        self.notice = None;
+                        Task::none()
+                    }
                 } else {
                     self.begin_edit()
                 }
             }
-            Message::EditBlock(index) => self.switch_block(index),
-            Message::EditorAction(action) => {
-                let style = self.style_set();
-                let kind = self
-                    .live
-                    .as_ref()
-                    .and_then(|live| self.doc.blocks.get(live.block))
-                    .map(|block| block.kind.clone());
-                let Some(kind) = kind else {
-                    return Task::none();
-                };
-                let Some(live) = self.live.as_mut() else {
-                    return Task::none();
-                };
-                let edit = action.is_edit();
-                let before = live.content.text();
-                live.content.perform(action);
-                let after = live.content.text();
-                let mut updated = None;
-                if edit && before != after {
-                    let mut source = live.source.clone();
-                    let changed = if after.is_empty() {
-                        source.clear();
-                        true
-                    } else {
-                        live::apply(&mut source, &live.display.map, &before, &after)
-                    };
-                    if changed {
-                        let display = live::build(&source, &kind, &style);
-                        if display.text != after {
-                            live.content = text_editor::Content::with_text(&display.text);
-                        }
-                        live.source = source;
-                        live.display = display;
-                        updated = Some((live.block, live.source.clone()));
-                    }
-                }
-                if let Some((block, source)) = updated {
-                    self.block_edits.insert(block, source);
-                    self.dirty = true;
-                }
-                Task::none()
-            }
-            Message::Save => {
-                if self.editing {
-                    self.save_and_finish()
-                } else {
-                    Task::none()
-                }
-            }
+            Message::Save => self.save_doc(false),
             Message::CloseSettings => {
                 self.settings_open = false;
                 Task::none()
@@ -347,10 +352,6 @@ impl App {
                 Task::none()
             }
             Message::OpenFind => {
-                if self.editing {
-                    self.notice = Some(String::from("先保存并退出编辑，再在本文中查找"));
-                    return Task::none();
-                }
                 self.find_open = true;
                 self.settings_open = false;
                 let focus = operation::focus(find_input_id());
@@ -406,7 +407,8 @@ impl App {
                     .pick_file()
                 {
                     self.pending_anchor = None;
-                    return self.open_path(path, None);
+                    let ratio = self.session.ratio_for(&path);
+                    return self.open_path(path, ratio);
                 }
                 Task::none()
             }
@@ -435,6 +437,7 @@ impl App {
                 if !self.can_leave_document() {
                     return Task::none();
                 }
+                self.images.clear();
                 if let Some(path) = self.path.clone() {
                     let ratio = self.scroll_ratio;
                     return self.open_path(path, Some(ratio));
@@ -444,9 +447,18 @@ impl App {
             Message::Minimize => self.win(|id| iced::window::minimize(id, true)),
             Message::ToggleMaximize => {
                 self.maximized = !self.maximized;
+                self.persist_session();
                 self.win(iced::window::toggle_maximize)
             }
-            Message::CloseWindow => self.win(iced::window::close),
+            Message::CloseWindow => {
+                if self.editor.dirty {
+                    self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存后再关闭"));
+                    Task::none()
+                } else {
+                    self.persist_session();
+                    self.win(iced::window::close)
+                }
+            }
             Message::DragWindow => self.win(iced::window::drag),
             Message::Resize(direction) => self.win(|id| iced::window::drag_resize(id, direction)),
             Message::WindowId(id) => {
@@ -461,6 +473,12 @@ impl App {
                 self.write_probe();
                 self.measure()
             }
+            Message::WindowMoved(pos) => {
+                if !self.maximized {
+                    self.window_pos = Some(pos);
+                }
+                Task::none()
+            }
             Message::WindowResized(size) => {
                 if size != self.window_size {
                     self.window_size = size;
@@ -468,45 +486,111 @@ impl App {
                 }
                 Task::none()
             }
-            Message::WindowCloseRequested => {
-                if self.editing && self.dirty {
+            Message::WindowCloseRequested(id) => {
+                if self.editor.dirty {
                     self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存后再关闭"));
                     Task::none()
                 } else {
-                    self.win(iced::window::close)
+                    self.persist_session();
+                    iced::window::close(id)
                 }
             }
             Message::Measure => self.measure(),
-            Message::Offsets(map) => {
+            Message::Offsets {
+                map,
+                target_y,
+                visible_block,
+            } => {
                 self.offsets = map;
                 self.refresh_heading(
                     self.viewport
                         .map(|viewport| viewport.absolute_offset().y)
                         .unwrap_or(0.0),
                 );
+                if self.pending_edit_focus {
+                    self.pending_edit_focus = false;
+                    if let Some(vb) = visible_block {
+                        let clamped = clamp_pos(&self.doc, DocPos::new(vb, 0, 0));
+                        self.editor.caret = clamped;
+                        self.editor.anchor = None;
+                    }
+                }
                 if let Some(index) = self.pending_jump.take() {
-                    if let Some(y) = self.offsets.get(&index).copied() {
-                        self.anim_current = y - 8.0;
-                        return offsets::scroll_to_y(y - 8.0);
+                    self.materialize_hint = None;
+                    if let Some(y) = target_y.or_else(|| self.offsets.get(&index).copied()) {
+                        let dest = (y - 8.0).max(0.0);
+                        self.anim_current = dest;
+                        return offsets::scroll_to_y(dest);
                     }
                 }
                 Task::none()
             }
             Message::Jump(index) => self.jump_block(index),
-            Message::Link(link) => self.follow_link(link),
             Message::Scroll(viewport) => {
                 let offset = viewport.absolute_offset().y;
                 self.viewport = Some(viewport);
                 self.anim_current = offset;
                 self.sync_ratio(offset);
                 self.refresh_heading(offset);
-                if self.offsets.is_empty() {
+                if self.offsets.is_empty() && !self.doc.headings.is_empty() {
                     return self.measure();
                 }
                 Task::none()
             }
             Message::Wheel(dy) => self.scroll_by(dy),
             Message::WheelPixels(dy) => self.scroll_by(dy),
+            Message::PageUp => {
+                if self.editing || self.modal_open() {
+                    return Task::none();
+                }
+                let step = self
+                    .viewport
+                    .map(|v| (v.bounds().height * 0.88).max(160.0))
+                    .unwrap_or(560.0);
+                self.scroll_by(-step)
+            }
+            Message::PageDown => {
+                if self.editing || self.modal_open() {
+                    return Task::none();
+                }
+                let step = self
+                    .viewport
+                    .map(|v| (v.bounds().height * 0.88).max(160.0))
+                    .unwrap_or(560.0);
+                self.scroll_by(step)
+            }
+            Message::ScrollHome => {
+                if self.editing || self.modal_open() {
+                    return Task::none();
+                }
+                self.anim_current = 0.0;
+                self.sync_ratio(0.0);
+                offsets::scroll_to_y(0.0)
+            }
+            Message::ScrollEnd => {
+                if self.editing || self.modal_open() {
+                    return Task::none();
+                }
+                let max = self
+                    .viewport
+                    .map(|v| (v.content_bounds().height - v.bounds().height).max(0.0))
+                    .unwrap_or(0.0);
+                self.anim_current = max;
+                self.sync_ratio(max);
+                offsets::scroll_to_y(max)
+            }
+            Message::LineUp => {
+                if self.editing || self.modal_open() {
+                    return Task::none();
+                }
+                self.scroll_by(-84.0)
+            }
+            Message::LineDown => {
+                if self.editing || self.modal_open() {
+                    return Task::none();
+                }
+                self.scroll_by(84.0)
+            }
             Message::ProbeFrame => {
                 self.write_probe();
                 Task::none()
@@ -523,7 +607,8 @@ impl App {
                 }
                 self.quick = None;
                 self.pending_anchor = None;
-                self.open_path(path, None)
+                let ratio = self.session.ratio_for(&path);
+                self.open_path(path, ratio)
             }
             Message::QuickOpenFirst => {
                 if !self.can_leave_document() {
@@ -532,7 +617,8 @@ impl App {
                 if let Some((path, _)) = self.quick_matches().into_iter().next() {
                     self.quick = None;
                     self.pending_anchor = None;
-                    return self.open_path(path, None);
+                    let ratio = self.session.ratio_for(&path);
+                    return self.open_path(path, ratio);
                 }
                 Task::none()
             }
@@ -553,12 +639,11 @@ impl App {
                     self.current_match = None;
                     self.search_rev += 1;
                 } else if self.editing {
-                    if self.dirty {
+                    if self.editor.dirty {
                         self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存"));
                     } else {
                         self.editing = false;
-                        self.live = None;
-                        self.block_edits.clear();
+                        self.notice = None;
                     }
                 }
                 Task::none()
@@ -590,8 +675,106 @@ impl App {
                 }
                 Task::none()
             }
+            Message::ShiftChanged(held) => {
+                self.shift_held = held;
+                Task::none()
+            }
+            Message::Doc(action) => self.handle_doc_action(action),
             Message::Noop => Task::none(),
         }
+    }
+
+    fn handle_doc_action(&mut self, action: DocAction) -> Task<Message> {
+        match action {
+            DocAction::SetSelection { caret, anchor } => {
+                self.editor.caret = clamp_pos(&self.doc, caret);
+                self.editor.anchor = anchor.map(|a| clamp_pos(&self.doc, a));
+                Task::none()
+            }
+            DocAction::MoveWord { left, extend } => {
+                if left {
+                    self.editor.move_word_left(&self.doc, extend);
+                } else {
+                    self.editor.move_word_right(&self.doc, extend);
+                }
+                Task::none()
+            }
+            DocAction::MoveDocEdge { end, extend } => {
+                if end {
+                    self.editor.move_doc_end(&self.doc, extend);
+                } else {
+                    self.editor.move_doc_start(&self.doc, extend);
+                }
+                Task::none()
+            }
+            DocAction::SelectAll => {
+                self.editor.select_all(&self.doc);
+                Task::none()
+            }
+            DocAction::FollowLink(link) => self.follow_link(link),
+            DocAction::ScrollToY(y) => offsets::scroll_to_y(y),
+            DocAction::AdjustScrollY(dy) => {
+                let current = self
+                    .viewport
+                    .map(|v| v.absolute_offset().y)
+                    .unwrap_or(self.anim_current);
+                let target = (current + dy).max(0.0);
+                self.anim_current = target;
+                offsets::scroll_to_y(target)
+            }
+            mutating => {
+                let prev_len = self.doc.blocks.len();
+                let prev_block = self.editor.caret.block;
+                let doc_path = self.path.clone();
+                let changed = {
+                    let doc_mut = Arc::make_mut(&mut self.doc);
+                    match mutating {
+                        DocAction::InsertText(text) => {
+                            self.editor.insert_text(doc_mut, &text, doc_path.as_deref())
+                        }
+                        DocAction::Enter { shift } => {
+                            self.editor.enter(doc_mut, shift, doc_path.as_deref())
+                        }
+                        DocAction::Tab { shift } => self.editor.tab(doc_mut, shift),
+                        DocAction::Backspace => self.editor.backspace(doc_mut),
+                        DocAction::Delete => self.editor.delete_forward(doc_mut),
+                        DocAction::DeleteSelection => self.editor.delete_selection(doc_mut),
+                        DocAction::ToggleFormat(fmt) => self.editor.toggle_format(doc_mut, fmt),
+                        DocAction::InsertTable => self.editor.insert_table(doc_mut, 3, 3),
+                        DocAction::TableOp(op) => self.editor.table_op(doc_mut, op),
+                        DocAction::ToggleCheckbox(block_idx) => {
+                            let ok = self.editor.toggle_task_checkbox(doc_mut, block_idx);
+                            if ok && !self.editing {
+                                self.notice = Some(String::from("有勾选改动，按 Ctrl+S 保存"));
+                            }
+                            ok
+                        }
+                        DocAction::Undo => self.editor.undo(doc_mut),
+                        DocAction::Redo => self.editor.redo(doc_mut),
+                        _ => false,
+                    }
+                };
+                if changed {
+                    let new_len = self.doc.blocks.len();
+                    let new_block = self.editor.caret.block;
+                    self.edited_block = if prev_len == new_len && prev_block == new_block {
+                        Some(new_block)
+                    } else {
+                        None
+                    };
+                    self.doc_rev += 1;
+                    self.offsets.clear();
+                    if self.find_open && !self.find_input.is_empty() {
+                        self.recompute_matches();
+                    }
+                }
+                Task::none()
+            }
+        }
+    }
+
+    fn modal_open(&self) -> bool {
+        self.quick.is_some() || self.about_open || self.settings_open
     }
 
     fn win<F>(&self, action: F) -> Task<Message>
@@ -610,6 +793,28 @@ impl App {
         }
     }
 
+    fn persist_session(&mut self) {
+        if std::env::var_os("SUDU_NO_SESSION").is_some() {
+            return;
+        }
+        self.session.last_path = self.path.as_ref().map(|p| p.to_string_lossy().to_string());
+        self.session.scroll_ratio = self.scroll_ratio;
+        if let Some(path) = self.path.clone() {
+            self.session.record_ratio(&path, self.scroll_ratio);
+        }
+        self.session.theme_idx = self.theme_idx;
+        self.session.font_scale = self.font_scale;
+        self.session.sidebar_open = self.sidebar_open;
+        self.session.window_size = [self.window_size.width, self.window_size.height];
+        if !self.maximized {
+            if let Some(pos) = self.window_pos {
+                self.session.window_pos = Some([pos.x, pos.y]);
+            }
+        }
+        self.session.maximized = self.maximized;
+        session::save(&self.session);
+    }
+
     fn after_metrics_change(&mut self) -> Task<Message> {
         self.offsets.clear();
         self.current_heading = None;
@@ -617,7 +822,7 @@ impl App {
     }
 
     fn can_leave_document(&mut self) -> bool {
-        if self.editing && self.dirty {
+        if self.editor.dirty {
             self.notice = Some(String::from("有未保存修改，按 Ctrl+S 保存后再切换"));
             false
         } else {
@@ -625,132 +830,21 @@ impl App {
         }
     }
 
-    fn style_set(&self) -> live::StyleSet {
-        let theme = theme::all()[self.theme_idx].clone();
-        live::StyleSet {
-            body: theme.body,
-            heading: Font {
-                weight: iced::font::Weight::Bold,
-                ..theme.body
-            },
-            mono: theme.mono,
-            text: theme.pal.text,
-            muted: theme.pal.muted,
-            accent: theme.pal.accent,
-        }
-    }
-
-    fn open_block(&mut self, index: usize) -> Task<Message> {
-        if !self.editing {
-            return Task::none();
-        }
-        if self.live.as_ref().is_some_and(|live| live.block == index) {
-            return operation::focus(editor_id());
-        }
-        let Some(block) = self.doc.blocks.get(index) else {
-            return Task::none();
-        };
-        if matches!(block.kind, BlockKind::Rule) {
-            return Task::none();
-        }
-        let source = self
-            .block_edits
-            .get(&index)
-            .cloned()
-            .unwrap_or_else(|| self.doc.source[block.span.clone()].to_string());
-        let display = live::build(&source, &block.kind, &self.style_set());
-        self.live = Some(LiveEdit {
-            block: index,
-            content: text_editor::Content::with_text(&display.text),
-            source,
-            display,
-        });
-        operation::focus(editor_id())
-    }
-
-    fn switch_block(&mut self, index: usize) -> Task<Message> {
-        let Some(block) = self.doc.blocks.get(index) else {
-            return Task::none();
-        };
-        let target_start = block.span.start;
-        if self.block_edits.is_empty() {
-            return self.open_block(index);
-        }
-        let mut shift = 0i64;
-        for (&edited, text) in &self.block_edits {
-            if let Some(block) = self.doc.blocks.get(edited) {
-                if block.span.end <= target_start {
-                    shift += text.len() as i64 - block.span.len() as i64;
-                }
-            }
-        }
-        let source = self.apply_block_edits();
-        let parsed = doc::parse(&source, self.path.as_deref());
-        self.doc = Arc::new(parsed);
-        self.doc_rev += 1;
-        self.block_edits.clear();
-        self.offsets.clear();
-        self.current_heading = None;
-        let target = (target_start as i64 + shift).max(0) as usize;
-        let next = self
-            .doc
-            .blocks
-            .iter()
-            .position(|block| block.span.start <= target && target <= block.span.end)
-            .or_else(|| {
-                self.doc
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, block)| block.span.start.abs_diff(target))
-                    .map(|(index, _)| index)
-            })
-            .unwrap_or(index);
-        self.open_block(next.min(self.doc.blocks.len().saturating_sub(1)))
-    }
-
     fn begin_edit(&mut self) -> Task<Message> {
-        self.edit_ratio = self.scroll_ratio;
         self.editing = true;
-        self.dirty = false;
-        self.live = None;
-        self.block_edits.clear();
-        self.find_open = false;
         self.settings_open = false;
         self.quick = None;
         self.notice = None;
-        match self
-            .doc
-            .blocks
-            .iter()
-            .position(|block| !matches!(block.kind, BlockKind::Rule))
-        {
-            Some(index) => self.open_block(index),
-            None => Task::none(),
-        }
+        self.editor.clamp(&self.doc);
+        self.pending_edit_focus = true;
+        self.measure()
     }
 
-    fn apply_block_edits(&self) -> String {
-        let mut source = self.doc.source.clone();
-        let mut edits: Vec<(usize, usize, &str)> = self
-            .block_edits
-            .iter()
-            .filter_map(|(&index, text)| {
-                self.doc
-                    .blocks
-                    .get(index)
-                    .map(|block| (block.span.start, block.span.end, text.as_str()))
-            })
-            .collect();
-        edits.sort_by_key(|edit| edit.0);
-        for (start, end, text) in edits.into_iter().rev() {
-            source.replace_range(start..end, text);
+    fn save_doc(&mut self, exit_after: bool) -> Task<Message> {
+        if !self.editing && !self.editor.dirty {
+            return Task::none();
         }
-        source
-    }
-
-    fn save_and_finish(&mut self) -> Task<Message> {
-        let source = self.apply_block_edits();
+        let source = doc::serialize(&self.doc);
         let path = match self.path.clone() {
             Some(path) => path,
             None => match rfd::FileDialog::new()
@@ -766,28 +860,24 @@ impl App {
             self.notice = Some(format!("保存失败：{error}"));
             return Task::none();
         }
-        let parsed = doc::parse(&source, Some(&path));
-        self.doc = Arc::new(parsed);
+        let mut saved_doc = doc::parse(&source, Some(&path));
+        doc::rebuild_metadata(&mut saved_doc);
+        self.doc = Arc::new(saved_doc);
         self.path = Some(path.clone());
         if self.root.is_none() {
             self.root = path.parent().map(Path::to_path_buf);
         }
+        self.edited_block = None;
         self.doc_rev += 1;
         self.offsets.clear();
-        self.current_heading = None;
-        self.pending_jump = None;
-        self.find_open = false;
-        self.find_input.clear();
-        self.matches = Arc::new(Vec::new());
-        self.current_match = None;
-        self.search_rev += 1;
-        self.editing = false;
-        self.live = None;
-        self.block_edits.clear();
-        self.dirty = false;
+        self.editor.dirty = false;
+        self.editor.clamp(&self.doc);
         self.notice = Some(String::from("已保存"));
-        self.scroll_ratio = self.edit_ratio;
-        offsets::snap_to_ratio(self.scroll_ratio)
+        if exit_after {
+            self.editing = false;
+        }
+        self.persist_session();
+        self.measure()
     }
 
     fn sync_ratio(&mut self, offset: f32) {
@@ -856,13 +946,9 @@ impl App {
     }
 
     fn jump_block(&mut self, index: usize) -> Task<Message> {
-        if let Some(y) = self.offsets.get(&index).copied() {
-            self.anim_current = y - 8.0;
-            offsets::scroll_to_y(y - 8.0)
-        } else {
-            self.pending_jump = Some(index);
-            self.measure()
-        }
+        self.pending_jump = Some(index);
+        self.materialize_hint = Some(index);
+        self.measure_target(Some(index))
     }
 
     fn follow_link(&mut self, link: Link) -> Task<Message> {
@@ -874,7 +960,7 @@ impl App {
                 self.last_link = Some(url);
                 Task::none()
             }
-            Link::Internal { path, anchor } => {
+            Link::Internal { path, anchor, .. } => {
                 let same = self.path.as_ref().is_some_and(|current| current == &path);
                 if same {
                     if let Some(anchor) = anchor {
@@ -884,7 +970,8 @@ impl App {
                     }
                 } else {
                     self.pending_anchor = anchor;
-                    self.open_path(path, None)
+                    let ratio = self.session.ratio_for(&path);
+                    self.open_path(path, ratio)
                 }
             }
         }
@@ -905,6 +992,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf, ratio: Option<f32>) -> Task<Message> {
+        self.persist_session();
         match doc::load(&path) {
             Ok(loaded) => {
                 self.doc = Arc::new(loaded);
@@ -912,6 +1000,8 @@ impl App {
                     self.root = path.parent().map(Path::to_path_buf);
                 }
                 self.path = Some(path);
+                self.edited_block = None;
+                self.materialize_hint = None;
                 self.doc_rev += 1;
                 self.offsets.clear();
                 self.current_heading = None;
@@ -924,12 +1014,10 @@ impl App {
                 self.quick = None;
                 self.notice = None;
                 self.editing = false;
-                self.live = None;
-                self.block_edits.clear();
-                self.dirty = false;
+                self.editor.reset(&self.doc);
                 self.anim_current = 0.0;
-                self.scroll_ratio = ratio.unwrap_or(0.0);
-                let mut task = offsets::snap_to_ratio(self.scroll_ratio);
+                self.scroll_ratio = ratio.unwrap_or(0.0).clamp(0.0, 1.0);
+                let mut tasks = vec![offsets::snap_to_ratio(self.scroll_ratio), self.measure()];
                 if let Some(anchor) = self.pending_anchor.take() {
                     if let Some(block) = self
                         .doc
@@ -938,10 +1026,11 @@ impl App {
                         .find(|heading| heading.slug == anchor || heading.text == anchor)
                         .map(|heading| heading.block)
                     {
-                        task = Task::batch([task, self.jump_block(block)]);
+                        tasks.push(self.jump_block(block));
                     }
                 }
-                task
+                self.persist_session();
+                Task::batch(tasks)
             }
             Err(error) => {
                 self.notice = Some(error);
@@ -951,51 +1040,21 @@ impl App {
     }
 
     fn measure(&self) -> Task<Message> {
-        let targets = self
-            .doc
-            .blocks
-            .iter()
-            .enumerate()
-            .map(|(index, block)| (block.id.clone(), index))
-            .collect();
-        offsets::collect(targets)
+        self.measure_target(self.pending_jump)
+    }
+
+    fn measure_target(&self, target: Option<usize>) -> Task<Message> {
+        let headings = self.doc.headings.iter().map(|h| h.block).collect();
+        offsets::collect(headings, target)
     }
 
     fn content_width(&self, max_width: f32) -> f32 {
-        let sidebar = if self.sidebar_open && !self.editing {
+        let sidebar = if self.sidebar_open {
             SIDEBAR_WIDTH
         } else {
             0.0
         };
         (self.window_size.width - sidebar - 120.0).clamp(MIN_CONTENT, max_width)
-    }
-
-    fn body_key(&self, t: &Theme) -> BodyKey {
-        let search = if self.find_open && !self.matches.is_empty() {
-            Some(Arc::new(SearchView {
-                matches: self.matches.clone(),
-                current: self.current_match,
-            }))
-        } else {
-            None
-        };
-        BodyKey {
-            data: Arc::new(BodyData {
-                doc: self.doc.clone(),
-                pal: t.pal,
-                body_font: t.body,
-                mono_font: t.mono,
-                size: t.size * self.font_scale,
-                line: t.line,
-                search,
-                renders: self.renders.clone(),
-            }),
-            doc_rev: self.doc_rev,
-            theme: self.theme_idx as u8,
-            size_q: (t.size * self.font_scale * 64.0) as u16,
-            line_q: (t.line * 64.0) as u16,
-            search_rev: self.search_rev,
-        }
     }
 
     fn quick_matches(&self) -> Vec<(PathBuf, String)> {
@@ -1024,12 +1083,13 @@ impl App {
         let all = theme::all();
         let t = &all[self.theme_idx];
         let pal = t.pal;
-        let main = column![
-            self.header(t, pal),
-            row![self.sidebar(t, pal), self.content(t, pal)].height(Length::Fill),
-            self.status(t, pal)
-        ]
-        .height(Length::Fill);
+        let mut main_col = vec![self.header(t, pal)];
+        if self.editing {
+            main_col.push(self.edit_toolbar(pal));
+        }
+        main_col.push(row![self.sidebar(t, pal), self.content(t, pal)].height(Length::Fill).into());
+        main_col.push(self.status(t, pal));
+        let main = Column::with_children(main_col).height(Length::Fill);
 
         let mut layers: Vec<Element<'_, Message>> = vec![main.into()];
         if self.settings_open {
@@ -1064,13 +1124,9 @@ impl App {
         );
         let title = mouse_area(
             container(
-                text(if self.dirty {
-                    format!("素读 — {} *", self.source_name())
-                } else {
-                    format!("素读 — {}", self.source_name())
-                })
-                .size(12)
-                .color(pal.muted),
+                text(self.title())
+                    .size(12)
+                    .color(pal.muted),
             )
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1084,11 +1140,12 @@ impl App {
         )
         .on_press(Message::DragWindow)
         .on_double_click(Message::ToggleMaximize);
-        let edit = if self.editing {
-            icon_button(icon_save(), true, pal, Message::Save)
+        let save_btn: Element<'_, Message> = if self.editing || self.editor.dirty {
+            icon_button(icon_save(), self.editor.dirty, pal, Message::Save).into()
         } else {
-            icon_button(icon_edit(), false, pal, Message::ToggleEdit)
+            Space::new().width(Length::Fixed(0.0)).into()
         };
+        let edit = icon_button(icon_edit(), self.editing, pal, Message::ToggleEdit);
         let search = icon_button(icon_search(), self.find_open, pal, Message::OpenFind);
         let settings = icon_button(
             icon_settings(),
@@ -1106,7 +1163,7 @@ impl App {
         let close = window_icon_button(icon_close(), true, pal, Message::CloseWindow);
         column![
             container(
-                row![sidebar, title, edit, search, settings, min, max, close]
+                row![sidebar, title, save_btn, edit, search, settings, min, max, close]
                     .height(Length::Fill)
                     .align_y(Alignment::Center)
             )
@@ -1122,8 +1179,99 @@ impl App {
         .into()
     }
 
+    fn edit_toolbar(&self, pal: Palette) -> Element<'_, Message> {
+        let mut items: Vec<Element<'_, Message>> = vec![
+            flat_button("B", false, pal)
+                .on_press(Message::Doc(DocAction::ToggleFormat(FormatKind::Bold)))
+                .into(),
+            flat_button("I", false, pal)
+                .on_press(Message::Doc(DocAction::ToggleFormat(FormatKind::Italic)))
+                .into(),
+            flat_button("</>", false, pal)
+                .on_press(Message::Doc(DocAction::ToggleFormat(FormatKind::Code)))
+                .into(),
+            flat_button("S", false, pal)
+                .on_press(Message::Doc(DocAction::ToggleFormat(FormatKind::Strike)))
+                .into(),
+            vline(pal.border, 1.0),
+            flat_button("撤销", false, pal)
+                .on_press(Message::Doc(DocAction::Undo))
+                .into(),
+            flat_button("重做", false, pal)
+                .on_press(Message::Doc(DocAction::Redo))
+                .into(),
+            flat_button("+表格", false, pal)
+                .on_press(Message::Doc(DocAction::InsertTable))
+                .into(),
+        ];
+
+        if let Some(block) = self.doc.blocks.get(self.editor.caret.block) {
+            if let BlockKind::Table(tbl) = &block.kind {
+                let cur_cell = tbl.cells.get(self.editor.caret.cell);
+                let cell_info = cur_cell
+                    .map(|c| format!("表 R{}·C{}", c.row + 1, c.col + 1))
+                    .unwrap_or_else(|| String::from("表格"));
+                items.extend([
+                    vline(pal.border, 1.0),
+                    text(cell_info).size(11).color(pal.muted).into(),
+                    flat_button("+行", false, pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::InsertRowBelow)))
+                        .into(),
+                    flat_button("+上行", false, pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::InsertRowAbove)))
+                        .into(),
+                    flat_button("-行", false, pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::DeleteRow)))
+                        .into(),
+                    flat_button("+列", false, pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::InsertColRight)))
+                        .into(),
+                    flat_button("-列", false, pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::DeleteCol)))
+                        .into(),
+                    flat_button("左", cur_cell.is_some_and(|c| c.align == CellAlign::Left), pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::Align(CellAlign::Left))))
+                        .into(),
+                    flat_button("中", cur_cell.is_some_and(|c| c.align == CellAlign::Center), pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::Align(CellAlign::Center))))
+                        .into(),
+                    flat_button("右", cur_cell.is_some_and(|c| c.align == CellAlign::Right), pal)
+                        .on_press(Message::Doc(DocAction::TableOp(TableOp::Align(CellAlign::Right))))
+                        .into(),
+                ]);
+            }
+        }
+
+        items.push(Space::new().width(Length::Fill).into());
+        items.push(
+            text("直接点击排版文字即可编辑 · Tab 跳格 · Ctrl+S 保存")
+                .size(11)
+                .color(pal.muted)
+                .into(),
+        );
+
+        column![
+            container(
+                Row::with_children(items)
+                    .spacing(4)
+                    .align_y(Alignment::Center)
+                    .height(Length::Fill)
+            )
+            .height(Length::Fixed(32.0))
+            .width(Length::Fill)
+            .padding(Padding::from([0.0, 12.0]))
+            .style(move |_| container::Style {
+                background: Some(pal.panel.into()),
+                text_color: Some(pal.text),
+                ..Default::default()
+            }),
+            hline(pal.border, 1.0)
+        ]
+        .into()
+    }
+
     fn sidebar(&self, _t: &Theme, pal: Palette) -> Element<'_, Message> {
-        if !self.sidebar_open || self.editing {
+        if !self.sidebar_open {
             return Space::new().into();
         }
         let mut list = Column::new().spacing(1).width(Length::Fill);
@@ -1199,12 +1347,40 @@ impl App {
 
     fn content(&self, t: &Theme, pal: Palette) -> Element<'_, Message> {
         let width = self.content_width(t.width);
-        let body: Element<'_, Message> = if self.editing {
-            self.live_body(t, pal)
+        let search = if self.find_open && !self.matches.is_empty() {
+            Some(Arc::new(SearchView {
+                matches: self.matches.clone(),
+                current: self.current_match,
+            }))
         } else {
-            iced::widget::lazy(self.body_key(t), |key| render_body(key)).into()
+            None
         };
-        let paper = container(body)
+        let doc_widget = DocWidget {
+            id: offsets::doc_id(),
+            doc: self.doc.clone(),
+            doc_rev: self.doc_rev,
+            edited_block: self.edited_block,
+            materialize_hint: self.materialize_hint,
+            images: self.images.clone(),
+            pal,
+            theme_idx: self.theme_idx,
+            body_font: t.body,
+            mono_font: t.mono,
+            size: t.size * self.font_scale,
+            line: t.line,
+            content_width: width,
+            editing: self.editing,
+            overlay_open: self.modal_open(),
+            caret: self.editor.caret,
+            anchor: self.editor.anchor,
+            search,
+            search_rev: self.search_rev,
+            renders: self.renders.clone(),
+            on_action: Box::new(Message::Doc),
+        }
+        .into_element();
+
+        let paper = container(doc_widget)
             .width(Length::Fixed(width))
             .padding(Padding {
                 top: 24.0,
@@ -1219,125 +1395,15 @@ impl App {
                 .on_scroll(Message::Scroll)
                 .height(Length::Fill),
             t.size * self.font_scale * t.line,
+            self.shift_held,
         );
         let base: Element<'_, Message> = scroller.into();
-        if self.find_open {
-            stack(vec![base, self.find_bar(t, pal)]).into()
+        let layers = if self.find_open {
+            vec![base, self.find_bar(t, pal)]
         } else {
-            base
-        }
-    }
-
-    fn live_body(&self, t: &Theme, _pal: Palette) -> Element<'_, Message> {
-        let key = self.body_key(t);
-        let mut column = Column::new().spacing(8).width(Length::Fill);
-        for (index, block) in self.doc.blocks.iter().enumerate() {
-            let view = if self.live.as_ref().is_some_and(|live| live.block == index) {
-                self.live_block_view(&key, index, block)
-            } else {
-                let view = block_view(&key, index, block);
-                if matches!(block.kind, BlockKind::Rule) {
-                    view
-                } else {
-                    let overlay = mouse_area(
-                        container(Space::new())
-                            .width(Length::Fill)
-                            .height(Length::Fill),
-                    )
-                    .on_press(Message::EditBlock(index))
-                    .interaction(iced::mouse::Interaction::Text);
-                    stack(vec![view, overlay.into()]).into()
-                }
-            };
-            column = column.push(view);
-        }
-        column.into()
-    }
-
-    fn live_block_view<'a>(
-        &'a self,
-        key: &BodyKey,
-        index: usize,
-        block: &'a Block,
-    ) -> Element<'a, Message> {
-        let Some(live) = self.live.as_ref() else {
-            return block_view(key, index, block);
+            vec![base]
         };
-        let pal = key.data.pal;
-        let size = block_size(key, &block.kind);
-        let line = match block.kind {
-            BlockKind::Code => 1.55,
-            BlockKind::Heading(_) => 1.35,
-            _ => key.data.line,
-        };
-        let heading = matches!(block.kind, BlockKind::Heading(_));
-        let code = matches!(block.kind, BlockKind::Code | BlockKind::TableRow { .. });
-        let quote = matches!(block.kind, BlockKind::Quote);
-        let font = if code {
-            key.data.mono_font
-        } else if heading {
-            Font {
-                weight: iced::font::Weight::Bold,
-                ..key.data.body_font
-            }
-        } else {
-            key.data.body_font
-        };
-        let value = if quote { pal.muted } else { pal.text };
-        let editor = text_editor(&live.content)
-            .id(editor_id())
-            .on_action(Message::EditorAction)
-            .font(font)
-            .size(size)
-            .line_height(LineHeight::Relative(line))
-            .padding(Padding::from([0.0, 0.0]))
-            .height(Length::Shrink)
-            .highlight_with::<live::MarkHighlighter>(live.display.settings(), live::format)
-            .style(move |_, _| text_editor::Style {
-                background: Color::TRANSPARENT.into(),
-                border: Border::default(),
-                placeholder: pal.muted,
-                value,
-                selection: pal.selection,
-            });
-        let inner: Element<'a, Message> = if let BlockKind::ListItem { marker, .. } = &block.kind {
-            row![
-                text(marker.clone())
-                    .size(size)
-                    .font(key.data.body_font)
-                    .color(pal.muted),
-                editor
-            ]
-            .spacing(6)
-            .into()
-        } else {
-            editor.into()
-        };
-        let is_header = matches!(block.kind, BlockKind::TableRow { header: true });
-        let background = if code || is_header {
-            Some(pal.code_bg.into())
-        } else {
-            None
-        };
-        let border = if matches!(block.kind, BlockKind::Code) {
-            Border {
-                color: pal.border,
-                width: 1.0,
-                radius: 4.0.into(),
-            }
-        } else {
-            Border::default()
-        };
-        container(inner)
-            .id(block.id.clone())
-            .padding(block_padding(&block.kind))
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background,
-                border,
-                ..Default::default()
-            })
-            .into()
+        stack(layers).into()
     }
 
     fn find_bar(&self, _t: &Theme, pal: Palette) -> Element<'_, Message> {
@@ -1452,6 +1518,13 @@ impl App {
             pal,
         ));
         menu = menu.push(menu_row(
+            "所见即所得编辑",
+            "Ctrl+E",
+            Some(self.editing),
+            Message::ToggleEdit,
+            pal,
+        ));
+        menu = menu.push(menu_row(
             "在本文中查找",
             "Ctrl+F",
             Some(self.find_open),
@@ -1502,19 +1575,26 @@ impl App {
         let card = container(
             column![
                 text("素读").size(24).font(t.body).color(pal.text),
-                text("轻量中文 Markdown 阅读器").size(13).color(pal.muted),
+                text("轻量中文 Markdown 阅读与所见即所得编辑器")
+                    .size(13)
+                    .color(pal.muted),
                 hline(pal.border, 1.0),
-                text("v0.1.0 · iced 0.14 · pulldown-cmark · tiny-skia")
+                text("阅读：PageUp/PageDown 翻页 · 拖选跨段跨表复制 · Ctrl+F 查找")
                     .size(11)
                     .color(pal.muted),
-                text("GNU toolchain build").size(11).color(pal.muted),
+                text("编辑：Ctrl+E 进入所见即所得 · Tab 跳表单元格 · Alt+方向键 增删行列")
+                    .size(11)
+                    .color(pal.muted),
+                text("格式：Ctrl+Shift+B/I/K/X 粗斜码删 · Ctrl+Z/Y 撤销重做 · Ctrl+S 保存")
+                    .size(11)
+                    .color(pal.muted),
                 flat_button("关闭", false, pal).on_press(Message::CloseAbout),
             ]
             .spacing(10)
             .padding(Padding::from([20.0, 22.0]))
             .align_x(Alignment::Center),
         )
-        .width(Length::Fixed(340.0))
+        .width(Length::Fixed(420.0))
         .style(move |_| container::Style {
             background: Some(pal.panel.into()),
             border: Border {
@@ -1628,23 +1708,12 @@ impl App {
             .or_else(|| self.last_link.clone())
             .unwrap_or_default();
         let progress = if self.editing {
-            String::from("编辑中")
+            format!("编辑 · 块 {}/{}", self.editor.caret.block + 1, self.doc.blocks.len().max(1))
         } else {
             format!("{:.0}%", self.scroll_ratio * 100.0)
         };
-        let words = if self.editing {
-            String::from("— 字")
-        } else {
-            format!("{} 字", self.doc.words)
-        };
-        let lines = if self.editing {
-            self.live
-                .as_ref()
-                .map(|live| format!("{} 行", live.content.line_count()))
-                .unwrap_or_default()
-        } else {
-            format!("{} 行", self.doc.lines)
-        };
+        let words = format!("{} 字", self.doc.words);
+        let lines = format!("{} 行", self.doc.lines);
         column![
             hline(pal.border, 1.0),
             container(
@@ -1744,8 +1813,9 @@ impl App {
 fn window_event((id, event): (iced::window::Id, iced::window::Event)) -> Option<Message> {
     match event {
         iced::window::Event::Opened { size, .. } => Some(Message::WindowOpened(id, size)),
+        iced::window::Event::Moved(pos) => Some(Message::WindowMoved(pos)),
         iced::window::Event::Resized(size) => Some(Message::WindowResized(size)),
-        iced::window::Event::CloseRequested => Some(Message::WindowCloseRequested),
+        iced::window::Event::CloseRequested => Some(Message::WindowCloseRequested(id)),
         _ => None,
     }
 }
@@ -1761,9 +1831,15 @@ fn window_event_probe((id, event): (iced::window::Id, iced::window::Event)) -> O
 
 fn key_event(
     event: iced::Event,
-    _status: iced::event::Status,
+    status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
+    if let iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+        return Some(Message::ShiftChanged(modifiers.shift()));
+    }
+    if status == iced::event::Status::Captured {
+        return None;
+    }
     let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = event
     else {
         return None;
@@ -1780,8 +1856,24 @@ fn key_event(
             Some(Message::KeyShiftF3)
         }
         iced::keyboard::Key::Named(iced::keyboard::key::Named::F3) => Some(Message::KeyF3),
-        iced::keyboard::Key::Character(c) if command => match c.as_str() {
-            "b" => Some(Message::ToggleSidebar),
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::PageUp) => Some(Message::PageUp),
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::PageDown) => {
+            Some(Message::PageDown)
+        }
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Home) if !command => {
+            Some(Message::ScrollHome)
+        }
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::End) if !command => {
+            Some(Message::ScrollEnd)
+        }
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp) if !command => {
+            Some(Message::LineUp)
+        }
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown) if !command => {
+            Some(Message::LineDown)
+        }
+        iced::keyboard::Key::Character(c) if command => match c.to_ascii_lowercase().as_str() {
+            "b" if !shift => Some(Message::ToggleSidebar),
             "f" => Some(Message::OpenFind),
             "e" => Some(Message::ToggleEdit),
             "s" => Some(Message::Save),
@@ -1800,10 +1892,6 @@ fn key_event(
 
 fn find_input_id() -> iced::widget::Id {
     iced::widget::Id::new("find-input")
-}
-
-fn editor_id() -> iced::widget::Id {
-    iced::widget::Id::new("live-editor")
 }
 
 fn quick_input_id() -> iced::widget::Id {
@@ -1858,7 +1946,7 @@ fn scan_markdown(root: &Path) -> Vec<PathBuf> {
 
 fn flat_button(label: &str, active: bool, pal: Palette) -> Button<'static, Message> {
     button(text(label.to_string()).size(12))
-        .padding(Padding::from([5.0, 8.0]))
+        .padding(Padding::from([4.0, 8.0]))
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
@@ -1936,7 +2024,7 @@ fn icon_button(
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill);
-    let button = button(content)
+    button(content)
         .width(Length::Fixed(34.0))
         .height(Length::Fixed(HEADER_HEIGHT))
         .padding(Padding::from(0.0))
@@ -1956,8 +2044,7 @@ fn icon_button(
                 shadow: Shadow::default(),
                 ..Default::default()
             }
-        });
-    button
+        })
 }
 
 fn window_icon_button(
@@ -1985,7 +2072,7 @@ fn window_icon_button(
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill);
-    let button = button(content)
+    button(content)
         .width(Length::Fixed(42.0))
         .height(Length::Fixed(HEADER_HEIGHT))
         .padding(Padding::from(0.0))
@@ -2012,8 +2099,7 @@ fn window_icon_button(
                 shadow: Shadow::default(),
                 ..Default::default()
             }
-        });
-    button
+        })
 }
 
 fn menu_row(
@@ -2124,264 +2210,67 @@ fn resize_strip(
         .into()
 }
 
-fn render_body(key: &BodyKey) -> Element<'static, Message> {
-    let started = std::time::Instant::now();
-    key.data.renders.fetch_add(1, Ordering::Relaxed);
-    let mut col = Column::new().spacing(8).width(Length::Fill);
-    for (index, block) in key.data.doc.blocks.iter().enumerate() {
-        col = col.push(block_view(key, index, block));
-    }
-    let element: Element<'static, Message> = col.into();
-    if let Some(path) = std::env::var_os("SUDU_TIMING") {
-        let _ = std::fs::write(path, format!("render_ms={}", started.elapsed().as_millis()));
-    }
-    element
-}
-
-fn block_view(key: &BodyKey, index: usize, block: &Block) -> Element<'static, Message> {
-    let pal = key.data.pal;
-    let line_height = match block.kind {
-        BlockKind::Code => 1.55,
-        BlockKind::Heading(_) => 1.35,
-        _ => key.data.line,
-    };
-    if matches!(block.kind, BlockKind::Rule) {
-        let line_color = pal.border;
-        return container(
-            container(Space::new().height(Length::Fixed(1.0)))
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(line_color.into()),
-                    ..Default::default()
-                }),
-        )
-        .id(block.id.clone())
-        .width(Length::Fill)
-        .padding(Padding {
-            top: 10.0,
-            right: 0.0,
-            bottom: 10.0,
-            left: 0.0,
-        })
-        .into();
-    }
-    let size = block_size(key, &block.kind);
-    let spans = block_spans(key, index, block, size);
-    let selection = pal.selection;
-    let rich = iced_selection::rich_text(spans)
-        .on_link_click(|message| message)
-        .size(size)
-        .line_height(LineHeight::Relative(line_height))
-        .style(move |_| iced_selection::text::Style {
-            color: None,
-            selection,
-        });
-    let rich: Element<'static, Message> = rich.into();
-    let pad = block_padding(&block.kind);
-    let is_code = matches!(block.kind, BlockKind::Code);
-    let is_header = matches!(block.kind, BlockKind::TableRow { header: true });
-    let bg = if is_code || is_header {
-        Some(pal.code_bg.into())
-    } else {
-        None
-    };
-    let border = if is_code {
-        Border {
-            color: pal.border,
-            width: 1.0,
-            radius: 4.0.into(),
-        }
-    } else {
-        Border::default()
-    };
-    container(rich)
-        .id(block.id.clone())
-        .padding(pad)
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: bg,
-            border,
-            ..Default::default()
-        })
-        .into()
-}
-
-fn block_padding(kind: &BlockKind) -> Padding {
-    match kind {
-        BlockKind::Heading(1) => Padding {
-            top: 14.0,
-            right: 0.0,
-            bottom: 8.0,
-            left: 0.0,
-        },
-        BlockKind::Heading(2) => Padding {
-            top: 12.0,
-            right: 0.0,
-            bottom: 4.0,
-            left: 0.0,
-        },
-        BlockKind::Heading(3) => Padding {
-            top: 10.0,
-            right: 0.0,
-            bottom: 2.0,
-            left: 0.0,
-        },
-        BlockKind::Heading(_) => Padding {
-            top: 8.0,
-            right: 0.0,
-            bottom: 2.0,
-            left: 0.0,
-        },
-        BlockKind::Code => Padding {
-            top: 10.0,
-            right: 12.0,
-            bottom: 10.0,
-            left: 12.0,
-        },
-        BlockKind::Quote => Padding {
-            top: 4.0,
-            right: 12.0,
-            bottom: 4.0,
-            left: 12.0,
-        },
-        BlockKind::ListItem { indent, .. } => Padding {
-            top: 2.0,
-            right: 0.0,
-            bottom: 2.0,
-            left: 8.0 + *indent as f32 * 18.0,
-        },
-        BlockKind::TableRow { .. } => Padding {
-            top: 3.0,
-            right: 8.0,
-            bottom: 3.0,
-            left: 8.0,
-        },
-        _ => Padding::from(0.0),
-    }
-}
-
-fn block_size(key: &BodyKey, kind: &BlockKind) -> f32 {
-    match kind {
-        BlockKind::Heading(1) => key.data.size * 1.7,
-        BlockKind::Heading(2) => key.data.size * 1.35,
-        BlockKind::Heading(3) => key.data.size * 1.15,
-        BlockKind::Heading(4) => key.data.size * 1.05,
-        BlockKind::Heading(_) => key.data.size,
-        BlockKind::Code => key.data.size * 0.9,
-        _ => key.data.size,
-    }
-}
-
-fn block_spans(
-    key: &BodyKey,
-    index: usize,
-    block: &Block,
-    size: f32,
-) -> Vec<iced::advanced::text::Span<'static, Message, Font>> {
-    let pal = key.data.pal;
-    let heading = matches!(block.kind, BlockKind::Heading(_));
-    let quote = matches!(block.kind, BlockKind::Quote);
-    let header = matches!(block.kind, BlockKind::TableRow { header: true });
-    let code_block = matches!(block.kind, BlockKind::Code);
-    let mut spans = Vec::new();
-    if let BlockKind::ListItem { marker, .. } = &block.kind {
-        spans.push(
-            span(marker.clone())
-                .size(size)
-                .font(key.data.body_font)
-                .color(pal.muted),
-        );
-    }
-    let search = key.data.search.as_ref();
-    let mut offset = 0usize;
-    for run in &block.runs {
-        let run_start = offset;
-        let run_end = offset + run.text.len();
-        let mut cuts = vec![run_start];
-        let mut matches_here: Vec<(usize, &TextMatch)> = Vec::new();
-        if let Some(view) = search {
-            for (match_index, found) in view.matches.iter().enumerate() {
-                if found.block == index && found.start < run_end && found.end > run_start {
-                    cuts.push(found.start.max(run_start));
-                    cuts.push(found.end.min(run_end));
-                    matches_here.push((match_index, found));
-                }
-            }
-        }
-        cuts.push(run_end);
-        cuts.sort_unstable();
-        cuts.dedup();
-        for pair in cuts.windows(2) {
-            let start = pair[0];
-            let end = pair[1];
-            if start >= end {
-                continue;
-            }
-            let text = &run.text[start - run_start..end - run_start];
-            if text.is_empty() {
-                continue;
-            }
-            let mut font = if run.code {
-                key.data.mono_font
-            } else {
-                key.data.body_font
-            };
-            if heading || run.bold || header {
-                font.weight = iced::font::Weight::Bold;
-            } else if !run.code {
-                font.weight = iced::font::Weight::Medium;
-            }
-            if run.italic {
-                font.style = iced::font::Style::Italic;
-            }
-            let color = if run.link.is_some() {
-                pal.accent
-            } else if quote {
-                pal.muted
-            } else {
-                pal.text
-            };
-            let mut piece = span(text.to_string()).size(size).font(font).color(color);
-            if run.strike {
-                piece = piece.strikethrough(true);
-            }
-            if run.code && !code_block {
-                piece = piece.background(pal.code_bg).border(Border {
-                    color: pal.border,
-                    width: 1.0,
-                    radius: 3.0.into(),
-                });
-            }
-            if let Some((match_index, _)) = matches_here
-                .iter()
-                .find(|(_, found)| found.start <= start && found.end >= end)
-            {
-                let current = search.and_then(|view| view.current) == Some(*match_index);
-                piece = piece.background(if current {
-                    pal.highlight_current
-                } else {
-                    pal.highlight
-                });
-            }
-            if let Some(link) = &run.link {
-                piece = piece.link(Message::Link(link.clone())).underline(true);
-            }
-            spans.push(piece);
-        }
-        offset = run_end;
-    }
-    spans
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn content_width_stays_positive() {
-        let mut app = App::new(None, Instant::now(), None);
+        let (mut app, _) = App::new(None, Session::default(), Instant::now(), None);
         app.window_size = Size::new(720.0, 800.0);
         app.sidebar_open = true;
         assert!(app.content_width(760.0) >= MIN_CONTENT);
+    }
+
+    #[test]
+    fn session_restores_theme_scale_and_last_file() {
+        let dir = std::env::temp_dir().join("sudu_test_app_restore");
+        let _ = std::fs::create_dir_all(&dir);
+        let md = dir.join("note.md");
+        std::fs::write(&md, "# 标题\n\n正文内容").expect("write md");
+
+        let mut sess = Session::default();
+        sess.last_path = Some(md.to_string_lossy().to_string());
+        sess.theme_idx = 2;
+        sess.font_scale = 1.25;
+        sess.sidebar_open = true;
+        sess.record_ratio(&md, 0.42);
+
+        let prev_no = std::env::var_os("SUDU_NO_SESSION");
+        let prev_theme = std::env::var_os("SUDU_THEME");
+        unsafe {
+            std::env::remove_var("SUDU_NO_SESSION");
+            std::env::remove_var("SUDU_THEME");
+        }
+        let (app, _) = App::new(None, sess, Instant::now(), None);
+        assert_eq!(app.path.as_deref(), Some(md.as_path()));
+        assert_eq!(app.theme_idx, 2);
+        assert!((app.font_scale - 1.25).abs() < 0.01);
+        assert!(app.sidebar_open);
+        assert!((app.scroll_ratio - 0.42).abs() < 0.01);
+
+        if let Some(v) = prev_no {
+            unsafe { std::env::set_var("SUDU_NO_SESSION", v) };
+        }
+        if let Some(v) = prev_theme {
+            unsafe { std::env::set_var("SUDU_THEME", v) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_and_escape_keep_edit_and_scroll_intact() {
+        let (mut app, _) = App::new(None, Session::default(), Instant::now(), None);
+        app.scroll_ratio = 0.55;
+        let _ = app.update(Message::ToggleEdit);
+        assert!(app.editing);
+        let _ = app.update(Message::Doc(DocAction::InsertText(String::from("测试插入"))));
+        assert!(app.editor.dirty);
+        let _ = app.update(Message::OpenFind);
+        assert!(app.find_open);
+        let _ = app.update(Message::Escape);
+        assert!(!app.find_open);
+        assert!(app.editing);
+        assert!((app.scroll_ratio - 0.55).abs() < 0.001);
     }
 }

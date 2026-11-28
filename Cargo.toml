@@ -1,6 +1,6 @@
 [package]
 name = "sudu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.95"
 description = "素读 — 轻量中文 Markdown 阅读器"
@@ -12,7 +12,6 @@ backend-wgpu = ["iced/wgpu"]
 
 [dependencies]
 iced = { version = "0.14", default-features = false, features = ["image-without-codecs", "advanced", "lazy", "crisp", "web-colors", "svg", "thread-pool"] }
-iced_selection = "0.5"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 open = "5"
 pulldown-cmark = { version = "0.12", default-features = false }

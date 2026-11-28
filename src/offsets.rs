@@ -1,29 +1,40 @@
 use crate::app::Message;
-use iced::advanced::widget::operation::{Outcome, Scrollable};
+use crate::doc_widget::DocWidgetState;
+use iced::advanced::widget::operation::Outcome;
 use iced::advanced::widget::Operation;
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{operation, Id};
-use iced::{Rectangle, Task, Vector};
+use iced::{Rectangle, Task};
+use std::any::Any;
 use std::collections::HashMap;
 
 pub const BODY_SCROLL: &str = "sudu-body";
+pub const DOC_WIDGET: &str = "sudu-doc";
 
 pub fn body_id() -> Id {
     Id::new(BODY_SCROLL)
 }
 
+pub fn doc_id() -> Id {
+    Id::new(DOC_WIDGET)
+}
+
 pub struct Collect {
-    targets: HashMap<Id, usize>,
-    content_top: Option<f32>,
-    out: HashMap<usize, f32>,
+    headings: Vec<usize>,
+    target_block: Option<usize>,
+    out_offsets: HashMap<usize, f32>,
+    target_y: Option<f32>,
+    visible_block: Option<usize>,
 }
 
 impl Collect {
-    pub fn new(targets: HashMap<Id, usize>) -> Self {
+    pub fn new(headings: Vec<usize>, target_block: Option<usize>) -> Self {
         Self {
-            targets,
-            content_top: None,
-            out: HashMap::new(),
+            headings,
+            target_block,
+            out_offsets: HashMap::new(),
+            target_y: None,
+            visible_block: None,
         }
     }
 }
@@ -33,42 +44,29 @@ impl Operation<Message> for Collect {
         operate(self);
     }
 
-    fn scrollable(
-        &mut self,
-        id: Option<&Id>,
-        _bounds: Rectangle,
-        content_bounds: Rectangle,
-        _translation: Vector,
-        _state: &mut dyn Scrollable,
-    ) {
-        if id == Some(&body_id()) {
-            self.content_top = Some(content_bounds.y);
+    fn custom(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Any) {
+        if id != Some(&doc_id()) {
+            return;
         }
-    }
-
-    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        let Some(top) = self.content_top else {
-            return;
-        };
-        let Some(id) = id else {
-            return;
-        };
-        if let Some(&index) = self.targets.get(id) {
-            self.out.insert(index, (bounds.y - top).max(0.0));
+        if let Some(doc_state) = state.downcast_mut::<DocWidgetState>() {
+            let (offsets, target_y) = doc_state.read_offsets(&self.headings, self.target_block);
+            self.out_offsets = offsets;
+            self.target_y = target_y;
+            self.visible_block = Some(doc_state.first_visible_block());
         }
     }
 
     fn finish(&self) -> Outcome<Message> {
-        if self.out.is_empty() {
-            Outcome::None
-        } else {
-            Outcome::Some(Message::Offsets(self.out.clone()))
-        }
+        Outcome::Some(Message::Offsets {
+            map: self.out_offsets.clone(),
+            target_y: self.target_y,
+            visible_block: self.visible_block,
+        })
     }
 }
 
-pub fn collect(targets: HashMap<Id, usize>) -> Task<Message> {
-    iced::advanced::widget::operate(Collect::new(targets))
+pub fn collect(headings: Vec<usize>, target_block: Option<usize>) -> Task<Message> {
+    iced::advanced::widget::operate(Collect::new(headings, target_block))
 }
 
 pub fn scroll_to_y(y: f32) -> Task<Message> {
@@ -90,3 +88,4 @@ pub fn snap_to_ratio(y: f32) -> Task<Message> {
         },
     )
 }
+

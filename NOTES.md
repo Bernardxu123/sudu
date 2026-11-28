@@ -100,6 +100,15 @@
 - exe 资源：`winresource` 直接跑 `windres` 会因中文源路径报 `Bad file descriptor`（`-I D:\AI\杂\素读`）；改为 `build.rs` 把 `icon.ico`/`icon.rc` 复制到 `OUT_DIR` 的 ASCII staging 目录，cwd 那里执行 `windres`，输出 `icon.o`，再用 `cargo:rustc-link-arg` 链接。
 - 文件关联的 `DefaultIcon` 指向 `dist\sudu.exe`，exe 内嵌图标后 Explorer / 打开方式可见。
 
+## v0.2.0 升级纪要（2026-11-28）
+
+- **统一文档引擎（`doc_widget.rs` + `editor.rs`）**：移除 `iced_selection` 与块级编辑隔离层 `live.rs`，改为直接在 `DocWidget` 内基于 `cosmic_text::Buffer` 与 `Paragraph` 管理整篇阅读态与连续 WYSIWYG 编辑态，实现跨块/跨表单元格连续选区复制、方向键按视觉行跨块移动、`InputMethod::Enabled` 就地 IME 合成、工具栏格式与表格单元格编辑（`Tab`/增删行列/对齐）。
+- **视口虚拟化**：`DocWidgetState` 维护全篇估算高度与 `prefix_ys`，仅在 `[local_top - 900, local_bottom + 900]` 区间实例化 `Paragraph`/表格/图像，超出 `2600px` 回收布局对象仅保留实测高度，编辑单块通过 `edited_block` 增量重排。
+- **表格与图像（`table.rs`、`images.rs`）**：补齐 GFM（行内代码管道/转义/空单元格/列数容错/`<br>`）与原生 HTML `<table>`（含 `colspan`/`rowspan`）解析、独立水平滚动条、居中/右对齐水平偏移校准；`ImageStore` 缓存解码本地光栅图（PNG/JPEG/WebP/GIF/BMP）与 SVG。
+- **会话持久化与滚动稳定（`session.rs`、`main.rs`、`app.rs`）**：新增 `session.json` 保存上次文件、分文件阅读比例、主题、字号、侧栏及窗口坐标尺寸；在 `window::Settings` 中显式设置 `exit_on_close_request: false`，确保 OS `WM_CLOSE` 能触发 `WindowCloseRequested` 完成落盘与未保存保护；将 `find_bar` 固定包裹在常量 `stack` 内，开关查找/`Esc` 不再重置 `Scrollable`；`SUDU_SESSION` / `SUDU_NO_SESSION=1` 供测试隔离。
+- **截图脚本（`tools/shot.ps1`）**：改用 `EnumWindows` 选取进程最大可见窗口（避开 winit `50x50` 隐藏辅助窗），并在后台会话 `CopyFromScreen` 失败时回退到 `PrintWindow(hwnd, hdc, 2)`。
+
+
 
 
 

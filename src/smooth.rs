@@ -6,13 +6,19 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector};
 pub struct SmoothScroll<'a> {
     content: Element<'a, Message>,
     line_step: f32,
+    shift_held: bool,
 }
 
 impl<'a> SmoothScroll<'a> {
-    pub fn new(content: impl Into<Element<'a, Message>>, line_step: f32) -> Self {
+    pub fn new(
+        content: impl Into<Element<'a, Message>>,
+        line_step: f32,
+        shift_held: bool,
+    ) -> Self {
         Self {
             content: content.into(),
             line_step,
+            shift_held,
         }
     }
 }
@@ -75,12 +81,12 @@ impl<'a> Widget<Message, iced::Theme, iced::Renderer> for SmoothScroll<'a> {
         viewport: &Rectangle,
     ) {
         if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
-            if cursor.position_over(layout.bounds()).is_some() {
+            if cursor.position_over(layout.bounds()).is_some() && !self.shift_held {
                 let message = match *delta {
-                    mouse::ScrollDelta::Lines { y, .. } if y != 0.0 => {
+                    mouse::ScrollDelta::Lines { x, y } if y != 0.0 && x.abs() <= y.abs() => {
                         Some(Message::Wheel(-y * self.line_step))
                     }
-                    mouse::ScrollDelta::Pixels { y, .. } if y != 0.0 => {
+                    mouse::ScrollDelta::Pixels { x, y } if y != 0.0 && x.abs() <= y.abs() => {
                         Some(Message::WheelPixels(-y))
                     }
                     _ => None,

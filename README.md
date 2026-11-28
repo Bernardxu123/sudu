@@ -4,9 +4,9 @@
 
 # 素读 · sudu
 
-**一个安静、轻量、中文优先的 Markdown 阅读器。**
+**一个安静、轻量、中文优先的 Markdown 阅读与所见即所得编辑器。**
 
-Rust + iced 原生窗口 · 无 Electron · 无 WebView · 渲染态原位编辑
+Rust + iced 原生窗口 · 无 Electron · 无 WebView · 连续排版原位所见即所得
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![iced](https://img.shields.io/badge/iced-0.14-blue)
@@ -21,64 +21,59 @@ Rust + iced 原生窗口 · 无 Electron · 无 WebView · 渲染态原位编辑
 
 ## 为什么做素读
 
-市面上的 Markdown 工具大多在往「知识库 / 编辑器 / AI 工作台」方向长：体积越来越大，启动越来越慢，阅读时还要和文件树、插件面板、账号系统抢注意力。
+市面上的 Markdown 工具大多在往「知识库 / 重型工作台」方向长：体积越来越大，启动越来越慢，阅读时还要和文件树、插件面板、账号系统抢注意力。
 
-素读反过来，只做一件事：**把 Markdown 读舒服，同时保留一个不打断阅读的编辑方式。**
+素读反过来，只做好一件事：**把 Markdown 读舒服，同时在同样的排版样式里直接修改。**
 
 ### 1. 真正的原生，不是浏览器壳
 
 Rust + [iced](https://github.com/iced-rs/iced) 直接创建原生窗口，没有 Electron、没有 WebView2、没有 Qt、没有 Go 运行时。
 
-- GPU 版 `sudu.exe`：**11.6 MB**，空闲 WorkingSet 约 **184 MB**。
-- 轻量版 `sudu-tiny.exe`：**7.0 MB**，空闲 WorkingSet 约 **27 MB**。
+- GPU 版 `sudu.exe`：**11.7 MB**，`wgpu` 硬件渲染，滚动跟手。
+- 轻量版 `sudu-tiny.exe`：**7.1 MB**，`tiny-skia` 软件渲染，启动极快。
 
-两种构建来自同一套代码，只切换渲染后端：`wgpu` 负责流畅，`tiny-skia` 负责省内存。
+两种构建来自同一套代码，只切换渲染后端。
 
-### 2. 编辑不把页面变成源码
+### 2. 连续的所见即所得，而不是一段段拆开改源码
 
-大多数 Markdown 编辑器进入编辑后会整页切成等宽源码：标题变小、表格变成竖线、代码块换行，阅读节奏被打断。
+大多数 Markdown 编辑器进入编辑后会把页面切回等宽源码，或者把文档拆成彼此割裂的输入框：标题失去层级、表格退化成竖线字符、跨块选区不可用。
 
-素读的编辑是**渲染态原位编辑**：
+素读 v0.2.0 在统一文档组件（`DocWidget`）里实现了**整篇连续的排版原位编辑**：
 
-- 点右上角铅笔或 `Ctrl+E`，页面排版保持不变。
-- 点击哪一段、哪个标题、哪个列表项、哪一行表格或代码块，**只有这一块**在原位变成编辑区。
-- `**粗体**`、`*斜体*`、`` `行内代码` ``、`[链接](url)` 的标记在这一块内隐藏，按阅读样式显示。
-- 表格行只隐藏首尾管道，内部单元格结构保留；代码块隐藏围栏，代码仍是等宽。
-- `Ctrl+S` 保存整篇，标记、链接 URL、代码围栏都会原样保留。
+- 点右上角编辑按钮或 `Ctrl+E`，整篇保留原有渲染样式（标题大号加粗、表格对齐网格、代码卡片、引用竖线、图片缩略图、加粗/斜体/代码/删除线样式均不变）。
+- **直接点击或方向键连续跨块移动**：`↑` / `↓` 按真实视觉行平滑跨越段落与表格行；鼠标拖拽可跨越标题、正文、引用、代码与表格多行多列连续选区，支持 `Ctrl+C` 复制（表格内单元格以 Tab 分隔）、跨块删除、撤销重做（`Ctrl+Z` / `Ctrl+Y`）。
+- **所见即所得实时 Markdown 触发**：输入 `# `、`## `、`- `、`1. `、`> `、`---`、```` ``` ````、`*` / `` ` `` / `[文本](url)` 自动转换为对应格式；中文输入法支持就地合成下划线展示。
+- **表格单元格原位编辑**：`Tab` / `Shift+Tab` 跳格（末格按 `Tab` 自动新增行），支持 `+行` / `+上行` / `-行` / `+列` / `-列` 与列对齐（`左` / `中` / `右`）工具栏及 `Alt+方向键` 快捷增删。
 
-> 这是块级实现，不是单缓冲 Typora。跨块连续选择、表格增删列等还在路线图上，详见[已知限制](#已知限制)。
+### 3. 完整表格解析排版 + 百万字虚拟化 + 本地图文
 
-### 3. 中文优先，不是翻译过来的英文阅读器
+- **完整表格引擎**：支持标准 GFM 表格（缺省首尾 `|`、空单元格、行内代码 `` `a | b` ``、转义 `\|`、`<br>` 换行、列数容错）及原生 HTML `<table>`（含 `colspan` / `rowspan` 合并单元格）；宽表提供自适应列宽与独立横向滚动条，不被强行压扁也不撑破版心。
+- **视口虚拟化**：按可见窗口加前后预加载区间惰性生成文本段落与表格布局（1 MB / 7,500+ 行压测文档首帧约 0.89 秒，与小文档几乎一致）。
+- **本地图片与 SVG 渲染**：支持文档相对/绝对路径及中文 `%20` 编码解码，内置解码 PNG / JPEG / WebP / GIF / BMP 与矢量 SVG 并等比居中展示。
 
-- 四套主题：白、纸、夜、米黄。
-- 正文统一系统无衬线字体（Microsoft YaHei UI / Segoe UI），代码 Consolas。
-- 行高、段距、正文宽度按中文阅读调校；中英文混排、中文标点、长文滚动都做过实测。
-- 只做标题大纲，不做文件树：章节随手可达，界面退到文字后面。
+### 4. 中文优先与记忆恢复
 
-### 4. 简单到没有第二层
-
-没有插件市场、没有账号、没有云同步、没有 AI 侧栏、没有多标签。
-
-打开就是文档；需要找文件时用 `Ctrl+O` / `Ctrl+Shift+O`，需要定位时用大纲和 `Ctrl+F`。所有功能都在一个 12 MB 的 exe 里。
+- 四套主题：**白、纸、夜、米黄**，统一系统无衬线字体（Microsoft YaHei UI / Segoe UI），代码 Consolas。
+- **会话记忆（`session.json`）**：自动记忆上次打开文件、分文件阅读比例、主题、字号、大纲开关及窗口位置尺寸；开关查找条/侧栏/编辑态时滚动位置稳定不重置。
 
 ## 截图
 
 <p align="center">
   <img src="docs/reading.png" width="49%" alt="阅读视图与大纲">
-  <img src="docs/editing.png" width="49%" alt="渲染态原位编辑">
+  <img src="docs/editing.png" width="49%" alt="连续所见即所得编辑与工具栏">
 </p>
 
 <p align="center">
-  <sub>左：阅读视图 + 大纲　右：渲染态原位编辑（页面排版不变，只有当前块可输入）</sub>
+  <sub>左：阅读视图 + 大纲　右：连续所见即所得编辑（保留排版样式，支持格式与表格工具栏）</sub>
 </p>
 
 <p align="center">
-  <img src="docs/features.png" width="49%" alt="表格、引用、代码">
-  <img src="docs/night.png" width="49%" alt="夜间主题">
+  <img src="docs/features.png" width="49%" alt="表格渲染与自适应排版">
+  <img src="docs/night.png" width="49%" alt="夜间主题表格">
 </p>
 
 <p align="center">
-  <sub>左：表格 / 引用 / 代码块　右：夜间主题</sub>
+  <sub>左：复杂表格与本地排版（米黄主题）　右：夜间主题表格渲染</sub>
 </p>
 
 <p align="center">
@@ -86,32 +81,30 @@ Rust + [iced](https://github.com/iced-rs/iced) 直接创建原生窗口，没有
 </p>
 
 <p align="center">
-  <sub>设置菜单：主题、大纲、查找、打开文件、字号、重读</sub>
+  <sub>设置菜单：主题、大纲、编辑切换、查找、打开文件、字号、重读</sub>
 </p>
 
 ## 功能
 
-- 打开 `.md` / `.markdown` / `.mdx`，或 `sudu.exe D:\path\doc.md` 直接打开。
-- 内置「快速入门」，第一次启动就有内容可读。
-- 左侧大纲：只列标题、按层级缩进、点击跳转、滚动时当前章节高亮。
-- 文档内搜索：`Ctrl+F`，`n / m` 计数，`Enter` / `Shift+Enter` / `F3` 跳转，命中高亮。
-- 渲染态原位编辑：标题、段落、列表、引用、代码块、表格行逐块编辑。
-- 四套主题、字号缩放、自定义无边框标题栏（拖动、双击最大化、四边缩放、最小化、关闭）。
-- 打开文件夹后用快速打开列表选文件（不建文件树）。
-- 选中/复制、站内相对链接、`#anchor` 跳转、外部链接交给系统浏览器。
+- 打开 `.md` / `.markdown` / `.mdx`，支持双击关联打开或 `sudu.exe D:\path\doc.md`。
+- 无参数启动自动恢复上次阅读文档与位置（首次启动展示内置「快速入门」）。
+- 左侧章节大纲：按层级缩进、点击跳转、滚动时当前章节自动高亮。
+- 文档内搜索：`Ctrl+F`（Unicode 大小写偏移安全匹配），`n / m` 计数，跳转保持列表位置。
+- 键盘阅读：`PageUp` / `PageDown` 翻页、`Home` / `End` 跳首尾、`↑` / `↓` 行滚动。
+- 跨块/跨单元格拖选复制、任务列表复选框直接点击切换、站内相对链接与 `#anchor` 锚点跳转。
 - 本地优先：不联网、不上传文档、不需要账号。
 
 ## 下载
 
-到 [Releases](https://github.com/Bernardxu123/sudu/releases/latest) 下载：
+到 [Releases](https://github.com/Bernardxu123/sudu/releases/latest) 下载 `v0.2.0`：
 
 | 文件 | 适合 | 体积 | 特点 |
 |---|---|---:|---|
-| `sudu.exe` | 日常使用 | 11.6 MB | GPU 渲染，滚动更跟手 |
-| `sudu-tiny.exe` | 老机器 / 省内存 | 7.0 MB | tiny-skia 软件渲染，启动快、占用低 |
+| `sudu.exe` | 日常使用 | 11.7 MB | GPU 渲染（wgpu），滚动跟手 |
+| `sudu-tiny.exe` | 老机器 / 轻量启动 | 7.1 MB | tiny-skia 软件渲染，启动极快 |
 | `SHA256SUMS.txt` | 校验 | — | 下载后核对 |
 
-Windows 11 x64，绿色免安装（Windows 10 未单独验证）。exe 未做代码签名，首次运行可能被 SmartScreen 拦截：点「更多信息」→「仍要运行」。介意的话可以自行从源码构建。
+Windows 11 x64，绿色免安装（Windows 10 未单独验证）。exe 未做代码签名，首次运行可能被 SmartScreen 拦截：点「更多信息」→「仍要运行」。
 
 ## 构建
 
@@ -144,52 +137,34 @@ cargo build --release --no-default-features --features backend-tiny
 
 | 操作 | 快捷键 |
 |---|---|
-| 打开文件 | `Ctrl+O` |
-| 打开文件夹（快速打开） | `Ctrl+Shift+O` |
+| 打开文件 / 文件夹快速打开 | `Ctrl+O` / `Ctrl+Shift+O` |
 | 大纲侧栏 | `Ctrl+B` |
-| 文档内查找 | `Ctrl+F` |
-| 进入 / 保存渲染态编辑 | `Ctrl+E` / `Ctrl+S` |
-| 下一个 / 上一个命中 | `Enter` / `Shift+Enter`，或 `F3` / `Shift+F3` |
-| 切换主题 | `Ctrl+T` |
-| 放大 / 缩小字号 | `Ctrl+=` / `Ctrl+-` |
-| 重读文件 | `Ctrl+R` |
-| 关闭浮层 | `Esc` |
+| 文档内查找 / 上下跳转 | `Ctrl+F` · `Enter` / `Shift+Enter` · `F3` / `Shift+F3` |
+| 阅读翻页 / 行滚 / 首尾 | `PageUp` / `PageDown` · `↑` / `↓` · `Home` / `End` |
+| 进入或完成所见即所得编辑 | `Ctrl+E` |
+| 保存修改 | `Ctrl+S` |
+| 粗体 / 斜体 / 行内代码 / 删除线 | `Ctrl+Shift+B` / `I` / `K` / `X` |
+| 撤销 / 重做 | `Ctrl+Z` / `Ctrl+Y` |
+| 表格跳格 / 末格新增行 | `Tab` / `Shift+Tab` |
+| 表格增删行列 | `Alt+方向键`（`Alt+Shift+↑/←` 删除行/列） |
+| 切换主题 / 放大 / 缩小字号 / 重读 | `Ctrl+T` / `Ctrl+=` / `Ctrl+-` / `Ctrl+R` |
+| 关闭浮层 / 退出编辑 | `Esc` |
 
-## 实现
+## 实现与测试
 
-- **UI / 渲染**：[iced 0.14](https://github.com/iced-rs/iced)，原生窗口、SVG 图标、自定义无边框标题栏。
-- **Markdown**：[pulldown-cmark 0.12](https://github.com/raphlinus/pulldown-cmark)，支持表格、删除线、任务列表、YAML frontmatter；原始 HTML、脚注、公式、Mermaid 暂不渲染。
-- **选区**：[iced_selection 0.5](https://crates.io/crates/iced_selection)，中文拖选、跨段清除。
-- **渲染态编辑**：`src/live.rs` 把 Markdown 源码转换成「隐藏标记的显示文本 + display→source offset map」，活动块用 `text_editor` 编辑，自定义 Highlighter 负责粗体/斜体/链接/行内代码样式；`Block.span` 记录每块可编辑的源码范围，保存时只替换内容，不破坏标记。
-- **两种后端**：默认 `backend-wgpu`；`backend-tiny` 用 tiny-skia，适合低配。
+- **核心渲染与交互（`src/doc_widget.rs`、`src/editor.rs`）**：基于 `iced_graphics::text::Paragraph` 与 `cosmic_text` 自建统一虚拟化文档组件，承担视口裁剪、高度缓存、连续选区、跨块光标导航、IME 预编辑合成与图像/表格绘制，移除了原先分段割裂的 `live.rs` 与 `iced_selection` 依赖。
+- **表格管线（`src/table.rs`、`src/table_widget.rs`）**：支持 GFM 与 HTML 表格 AST 构造、列宽智能预算、单元格行内样式及 Markdown/HTML 序列化回写。
+- **图像与会话（`src/images.rs`、`src/session.rs`）**：本地光栅图（`image`）与 SVG 解码缓存；零外部依赖 JSON 会话持久化。
+- **验证情况**：`cargo test` **24 项测试全部通过**，双后端（`backend-wgpu` / `backend-tiny`）均零警告编译通过；`dist\sudu.exe` 实测首帧约 `905 ms`，`dist\sudu-tiny.exe` 约 `147 ms`。
 
-## 实测
+## 已知边界
 
-本机 Windows 11 / 32 GB / 125% DPI，release 构建：
-
-| 后端 | exe | 首事件中位 | 空闲 WorkingSet | 快速滚轮 CPU |
-|---|---:|---:|---:|---:|
-| wgpu（默认） | 11.6 MB | 968 ms | 184 MB | 0.03 核 |
-| tiny-skia | 7.0 MB | 137 ms | 27 MB | 0.56 核 |
-
-`cargo test`：10 个测试通过（标题 slug、链接 percent-decode、搜索、引用/表格类型、内容宽度、块源码范围、行内标记隐藏/样式、链接目标隐藏、显示到源码的编辑映射、引用前缀与表格外框）。
-
-## 已知限制
-
-这是一个 v0.1.0 的阅读器，不是完整编辑器：
-
-- 一次只编辑一块；不能跨块连续选择、拖拽、批量格式化。
-- 表格不能增删行列；链接只能改显示文字，不能改 URL；标题不能直接改级别。
-- 没有 B/I 工具栏或 Markdown 快捷键。
-- 图片目前显示 `[图片：alt]` 占位，不加载本地图片。
-- 1 MB 文档仍会一次性构建全部块；虚拟列表待做。
-- 会话恢复、单实例、自动更新未做。
-- 仅在 Windows 11 x64 验证；Windows 10 / Linux / macOS 未测试。
+- 仍专注于轻量本地读写：数学公式、Mermaid、脚注暂不渲染；网络图片仅显示地址占位卡不联网拉取。
+- 仅在 Windows 11 x64 验证；Windows 10 / Linux / macOS 未单独实测。
 
 ## 设计参考与许可
 
-- [rmdv](https://github.com/minchenlee/rmdv)（MIT）：主题组织、事件→元素、锚点滚动、`CollectOffsets` 模式给了很大启发。
-- [Moeka](https://github.com/MoekaProject/moeka)（GPL-3.0-or-later）：只借鉴「源码 buffer + 标记隐藏 + display↔source 映射」的编辑思路，未复制代码。
+- [rmdv](https://github.com/minchenlee/rmdv)（MIT）：主题组织、事件→元素、锚点滚动模式给了很大启发。
 - 图标：iconly Light-Outline 的 Search / Setting / Edit / Tick，窗口控件为同风格自绘 SVG；应用图标由项目作者提供。
 - 字体不捆绑，使用系统 Microsoft YaHei UI / Segoe UI / Consolas。
 
